@@ -406,5 +406,67 @@ class ProlongMakeInsufficientFundsTest(unittest.TestCase):
         self.assertIn('Not enough', result['warning'])
 
 
+class DocumentedOrderExamplesTest(unittest.TestCase):
+    """
+    Примеры из README: коды уезжают ПОЗИЦИОННО в *Id-аргументы, без цепочек None и без
+    options ради кодов. У каждого *Id-поля на бэкенде есть фолбэк
+    (normalizeOrderReferenceCodes): значение, не являющееся валидным id, резолвится как код,
+    если соответствующий *Code пуст. Исключение — rotationId: он обязан быть ЧИСЛОМ МИНУТ
+    (0 = "By Link"), '5m'/'10m' сервер отвергает.
+    """
+
+    def test_ipv4_example_passes_codes_positionally(self):
+        api, session = make_api([envelope({'total': 10})])
+        api.setPaymentId('PAYMENT_ID')
+        api.orderCalcIpv4('USA', '1m', 2, customTargetName='seo', uptime=True)
+        self.assertEqual(session.last['json'], {
+            'sectionCode': 'ipv4', 'paymentId': 'PAYMENT_ID', 'countryId': 'USA',
+            'periodId': '1m', 'quantity': 2, 'customTargetName': 'seo', 'uptime': True})
+
+    def test_ipv4_example_without_target_would_fail_locally(self):
+        """Головной пример README без customTargetName не доходил до сети."""
+        api, session = make_api()
+        with self.assertRaises(ValueError):
+            api.orderCalcIpv4('USA', '1m', 2)
+        self.assertEqual(session.calls, [])
+
+    def test_mobile_example_sends_rotation_as_minutes(self):
+        api, session = make_api([envelope({'total': 10})])
+        api.orderCalcMobile('USA', '1m', 1, operatorId='ee_unitedkingdom', rotationId=5)
+        payload = session.last['json']
+        self.assertEqual(payload['countryId'], 'USA')
+        self.assertEqual(payload['periodId'], '1m')
+        self.assertEqual(payload['operatorId'], 'ee_unitedkingdom')
+        self.assertEqual(payload['rotationId'], 5)
+        self.assertIsInstance(payload['rotationId'], int)
+        self.assertEqual(payload['mobileServiceType'], 'dedicated')
+        # никаких *Code и никаких None в теле
+        self.assertFalse([key for key in payload if key.endswith('Code')
+                          and key != 'sectionCode'])
+        self.assertNotIn(None, payload.values())
+
+    def test_mix_example_passes_package_tag_positionally(self):
+        api, session = make_api([envelope({'total': 10})])
+        api.orderCalcMix('usa-europe-mix_IPv4', '1m', 1)
+        self.assertEqual(session.last['json'], {
+            'sectionCode': 'mix', 'mixId': 'usa-europe-mix_IPv4',
+            'periodId': '1m', 'quantity': 1})
+
+    def test_resident_example_passes_tarif_positionally(self):
+        api, session = make_api([envelope({'total': 10})])
+        api.orderCalcResident('TARIF_ID')
+        self.assertEqual(session.last['json'], {
+            'sectionCode': 'resident', 'tarifId': 'TARIF_ID'})
+
+    def test_prolong_example_passes_codes_in_id_fields(self):
+        api, session = make_api([envelope({'orderId': '68b1f0c4e13a4c0f1a2b3c4d'})])
+        api.prolongMake('mix', orderSeparatorIds=['SEPARATOR_ID'], periodId='1m',
+                        paymentId='balance', coupon='SALE10')
+        self.assertTrue(session.last['url'].endswith('prolong/make/mix'))
+        self.assertEqual(session.last['json'], {
+            'orderSeparatorIds': ['SEPARATOR_ID'], 'periodId': '1m',
+            'paymentId': 'balance', 'coupon': 'SALE10'})
+
+
 if __name__ == '__main__':
     unittest.main()

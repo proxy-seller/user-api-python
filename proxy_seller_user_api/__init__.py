@@ -102,7 +102,13 @@ class Api:
         return False
 
     def setPaymentId(self, id):
-        """Payment system id (MongoDB ObjectId from balance/payments/list)."""
+        """
+        Payment system id (MongoDB ObjectId from balance/payments/list).
+
+        В order/* и prolong/* сюда можно положить и КОД платёжной системы (например
+        'balance'): сервер, не найдя ObjectId, резолвит значение как код. Исключение —
+        balance/add, он принимает только настоящий ObjectId (см. balanceAdd).
+        """
         self.paymentId = id
 
     def getPaymentId(self):
@@ -494,8 +500,22 @@ class Api:
                 ключей, что в v1: ipv4, ipv6, mobile, isp, mix, mix_isp, resident, scraper.
 
         Returns:
-            dict: The guide information for creating an order. Все идентификаторы внутри
-                (country/period/mix/operator/rotation/tarif) — ObjectId-СТРОКИ.
+            dict: The guide information for creating an order. Идентификаторы внутри —
+                ObjectId-СТРОКИ, КРОМЕ ротации: rotations[].id — это ЧИСЛО МИНУТ
+                (0 = "By Link").
+
+                С указанным типом раздел приходит завёрнутым: {'items': {...}}; без типа —
+                словарь разделов сразу.
+
+                Что реально приходит в ответе (не больше и не меньше):
+                    country[]: id, name, alpha3 → alpha3 и есть countryCode;
+                    period[]: id, name ("1 month") → КОДА периода здесь НЕТ;
+                    mobile country[].operators.{dedicated,shared}[]: id, name,
+                        rotations[{id, name}] → отдельного operatorCode нет, передавайте
+                        полученный id как есть (сервер резолвит и ObjectId, и tag);
+                    mix/mix_isp country[]: id, name, alpha3 (null), tag → tag и есть mixCode;
+                    mix/mix_isp quantities[]: id, name, quantities — без tag;
+                    resident tarifs[]: id, name, personal → КОДА тарифа здесь НЕТ.
         """
         if type is None:
             return self.request('GET', 'reference/list')
@@ -510,7 +530,18 @@ class Api:
         return {'paymentId': self.getPaymentId()}
 
     def mergeOrderOptions(self, payload, options=None):
-        """Merge v2 identifiers/codes while avoiding conflicting id/code pairs."""
+        """
+        Merge v2 identifiers/codes while avoiding conflicting id/code pairs.
+
+        Отдельные *Code-поля нужны только для совместимости: у каждого *Id есть серверный
+        фолбэк (normalizeOrderReferenceCodes) — если значение не является валидным id, а
+        соответствующий *Code пуст, значение резолвится КАК КОД. Поэтому код достаточно
+        передать прямо в countryId / periodId / operatorId / mixId / tarifId / paymentId,
+        цепочки None и словарь options ради кодов не нужны.
+
+        rotationCode фолбэка не имеет вообще: он лишь проверяется на целое число и
+        копируется в rotationId, так что пользуйтесь сразу rotationId (МИНУТЫ).
+        """
         values = options or {}
         if not isinstance(values, dict):
             raise TypeError('order options must be a dict')
@@ -575,6 +606,10 @@ class Api:
     def prepareMobile(self, countryId=None, periodId=None, quantity=None, authorization=None,
                       coupon=None, operatorId=None, rotationId=None,
                       mobileServiceType='dedicated', options=None):
+        """
+        Собрать payload мобильного заказа. countryId / periodId / operatorId принимают
+        ObjectId ЛИБО код, rotationId — ЧИСЛО МИНУТ (0 = "By Link"), кодов у него нет.
+        """
         if isinstance(countryId, dict):
             return self.mergeOrderOptions({
                 **self.paymentOptions(), 'sectionCode': 'mobile',
@@ -654,8 +689,13 @@ class Api:
         Args:
             data (dict): Free format dictionary to send into endpoint. ``sectionCode``:
                 ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident | scraper (значение
-                нормализуется: регистр и '-'/' ' -> '_'). Все идентификаторы —
-                ObjectId-СТРОКИ; вместо них можно передавать стабильные *Code.
+                нормализуется: регистр и '-'/' ' -> '_').
+
+                countryId / periodId / operatorId / mixId / tarifId / paymentId — ObjectId-
+                строка ЛИБО код: сервер резолвит код прямо в этих полях, отдельные *Code
+                передавать не обязательно.
+
+                rotationId — ЧИСЛО МИНУТ (0 = "By Link"), ни ObjectId, ни кода у него нет.
 
         Returns:
             dict: The response from the endpoint.
@@ -669,8 +709,9 @@ class Api:
 
         Args:
             data (dict): Free format dictionary to send into endpoint. ``sectionCode``:
-                ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident | scraper. Все
-                идентификаторы — ObjectId-СТРОКИ (в том числе orderId в ответе).
+                ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident | scraper.
+                Идентификаторы — ObjectId-СТРОКИ (в том числе orderId в ответе), и в каждом
+                *Id вместо ObjectId принимается код (см. orderCalc). rotationId — МИНУТЫ.
 
         Returns:
             dict: The response from the endpoint.
@@ -680,32 +721,85 @@ class Api:
 
     def orderCalcIpv4(self, countryId=None, periodId=None, quantity=None, authorization=None,
                       coupon=None, customTargetName=None, options=None, **order_options):
-        """Calculate IPv4 by legacy IDs or v2 code/options."""
+        """
+        Calculate IPv4.
+
+        Args:
+            countryId (str): ObjectId страны ЛИБО её код — alpha3 из reference/list
+                (country[].alpha3, например 'USA'; сервер приводит к верхнему регистру).
+            periodId (str): ObjectId периода ЛИБО код периода (например '1m'; сервер
+                приводит к нижнему регистру). Кода периода в reference/list нет — там только
+                id и name, так что либо берите id, либо используйте известный вам код.
+            quantity (int): Количество прокси.
+            authorization (str): Необязательно.
+            coupon (str): Необязательно.
+            customTargetName (str): Цель заказа. ОБЯЗАТЕЛЬНА для ipv4 (иначе локальный
+                ValueError вместо серверного "Incorrect goal", code 14).
+            options (dict): Остальные поля payload (uptime, paymentId, …). То же самое можно
+                передать именованными аргументами. Для передачи кодов options НЕ нужен —
+                коды принимаются прямо в countryId/periodId.
+
+        Returns:
+            dict: The response from the endpoint.
+        """
         return self.orderCalc(self.prepareRegular(
             'ipv4', countryId, periodId, quantity, authorization, coupon, customTargetName,
             self._order_options(options, order_options)))
 
     def orderCalcIsp(self, countryId=None, periodId=None, quantity=None, authorization=None,
                      coupon=None, customTargetName=None, options=None, **order_options):
-        """Calculate ISP by legacy IDs or v2 code/options."""
+        """
+        Calculate ISP. Аргументы как у orderCalcIpv4(): countryId и periodId принимают
+        ObjectId ЛИБО код, customTargetName обязателен.
+        """
         return self.orderCalc(self.prepareRegular(
             'isp', countryId, periodId, quantity, authorization, coupon, customTargetName,
             self._order_options(options, order_options)))
 
     def orderCalcMix(self, mixId=None, periodId=None, quantity=None, authorization=None,
                      coupon=None, customTargetName=None, options=None, **order_options):
-        """Calculate MIX. The first legacy argument is a MIX id, not a country id."""
+        """
+        Calculate MIX. The first argument is a MIX package, not a country.
+
+        Args:
+            mixId (str): ObjectId mix-пакета ЛИБО его tag (точное совпадение). tag есть в
+                reference/list: mix/mix_isp -> country[].tag (например
+                'usa-europe-mix_IPv4'); в quantities[] его нет.
+            periodId (str): ObjectId периода ЛИБО код периода ('1m').
+            quantity (int): Количество прокси в пакете (из quantities[].quantities).
+            customTargetName (str): Для mix не требуется, если пакет распознан
+                (mixId/mixCode либо countryId='PACKAGE_ID:QUANTITY').
+
+        Returns:
+            dict: The response from the endpoint.
+        """
         return self.orderCalc(self.prepareMix(
             mixId, periodId, quantity, authorization, coupon, customTargetName,
             self._order_options(options, order_options)))
 
     def orderCalcMixByCode(self, mixCode, periodCode, quantity, **options):
+        """
+        Псевдоним orderCalcMix() через явные *Code-поля. Те же значения принимаются
+        позиционно: orderCalcMix(mixCode, periodCode, quantity).
+        """
         return self.orderCalcMix(
             mixCode=mixCode, periodCode=periodCode, quantity=quantity, **options)
 
     def orderCalcIpv6(self, countryId=None, periodId=None, quantity=None, authorization=None,
                       coupon=None, customTargetName=None, protocol=None, options=None, **order_options):
-        """Calculate the order IPv6."""
+        """
+        Calculate the order IPv6.
+
+        Args:
+            countryId (str): ObjectId страны ЛИБО alpha3-код ('USA').
+            periodId (str): ObjectId периода ЛИБО код периода ('1m').
+            customTargetName (str): ОБЯЗАТЕЛЕН для ipv6.
+            protocol (str): http | https | socks | socks5 (регистр не важен); прочие значения
+                сервер отвергает ошибкой "Incorrect protocol".
+
+        Returns:
+            dict: The response from the endpoint.
+        """
         return self.orderCalc(self.prepareIpv6(
             countryId, periodId, quantity, authorization, coupon, customTargetName, protocol,
             self._order_options(options, order_options)))
@@ -713,44 +807,100 @@ class Api:
     def orderCalcMobile(self, countryId=None, periodId=None, quantity=None, authorization=None,
                         coupon=None, operatorId=None, rotationId=None,
                         mobileServiceType='dedicated', options=None, **order_options):
-        """Calculate mobile; mobileServiceType is ``shared`` or ``dedicated``."""
+        """
+        Calculate mobile.
+
+        Args:
+            countryId (str): ObjectId страны ЛИБО её alpha3-код ('USA').
+            periodId (str): ObjectId периода ЛИБО код периода ('1m').
+            quantity (int): Количество прокси.
+            authorization (str): Необязательно.
+            coupon (str): Необязательно.
+            operatorId (str): ObjectId мобильного оператора ЛИБО его tag (используется КАК
+                ЕСТЬ, регистр важен). Берите значение из reference/list
+                country[].operators.dedicated[].id (или .shared[].id) и передавайте как есть —
+                сервер резолвит и ObjectId, и tag; отдельного operatorCode в справочнике нет.
+            rotationId (int): Интервал ротации в МИНУТАХ, 0 = "By Link". Ни ObjectId, ни кода
+                у поля нет: '5m'/'10m' сервер отвергает ("Set existed [rotationCode] from
+                reference"). Допустимые значения — rotations[].id из reference/list, это уже
+                минуты.
+            mobileServiceType (str): shared | dedicated (по умолчанию dedicated).
+
+        Returns:
+            dict: The response from the endpoint.
+        """
         return self.orderCalc(self.prepareMobile(
             countryId, periodId, quantity, authorization, coupon, operatorId, rotationId,
             mobileServiceType, self._order_options(options, order_options)))
 
     def orderCalcResident(self, tarifId=None, coupon=None, options=None, **order_options):
-        """Calculate the order Resident."""
+        """
+        Calculate the order Resident.
+
+        Args:
+            tarifId (str): ObjectId резидентского тарифа ЛИБО его code (точное совпадение).
+                В reference/list у tarifs[] есть только id, name и personal — кода тарифа
+                там нет, так что берите id.
+            coupon (str): Необязательно.
+
+        Returns:
+            dict: The response from the endpoint.
+        """
         return self.orderCalc(self.prepareResident(
             tarifId, coupon, self._order_options(options, order_options)))
 
     def orderMakeIpv4(self, countryId=None, periodId=None, quantity=None, authorization=None,
                       coupon=None, customTargetName=None, options=None, **order_options):
-        """Create an order IPv4. Attention! Deducts money from the balance."""
+        """
+        Create an order IPv4. Attention! Deducts money from the balance.
+
+        Аргументы как у orderCalcIpv4(): countryId и periodId принимают ObjectId ЛИБО код,
+        customTargetName обязателен.
+        """
         return self.orderMake(self.withGenerateAuth(self.prepareRegular(
             'ipv4', countryId, periodId, quantity, authorization, coupon, customTargetName,
             self._order_options(options, order_options))))
 
     def orderMakeIsp(self, countryId=None, periodId=None, quantity=None, authorization=None,
                      coupon=None, customTargetName=None, options=None, **order_options):
-        """Create an order ISP. Attention! Deducts money from the balance."""
+        """
+        Create an order ISP. Attention! Deducts money from the balance.
+
+        Аргументы как у orderCalcIpv4(): countryId и periodId принимают ObjectId ЛИБО код,
+        customTargetName обязателен.
+        """
         return self.orderMake(self.withGenerateAuth(self.prepareRegular(
             'isp', countryId, periodId, quantity, authorization, coupon, customTargetName,
             self._order_options(options, order_options))))
 
     def orderMakeMix(self, mixId=None, periodId=None, quantity=None, authorization=None,
                      coupon=None, customTargetName=None, options=None, **order_options):
-        """Create an order MIX. Attention! Deducts money from the balance."""
+        """
+        Create an order MIX. Attention! Deducts money from the balance.
+
+        Аргументы как у orderCalcMix(): mixId — ObjectId пакета ЛИБО его tag,
+        periodId — ObjectId периода ЛИБО код периода.
+        """
         return self.orderMake(self.withGenerateAuth(self.prepareMix(
             mixId, periodId, quantity, authorization, coupon, customTargetName,
             self._order_options(options, order_options))))
 
     def orderMakeMixByCode(self, mixCode, periodCode, quantity, **options):
+        """
+        Псевдоним orderMakeMix() через явные *Code-поля. Те же значения принимаются
+        позиционно: orderMakeMix(mixCode, periodCode, quantity).
+        """
         return self.orderMakeMix(
             mixCode=mixCode, periodCode=periodCode, quantity=quantity, **options)
 
     def orderMakeIpv6(self, countryId=None, periodId=None, quantity=None, authorization=None,
                       coupon=None, customTargetName=None, protocol=None, options=None, **order_options):
-        """Create an order IPv6. Attention! Deducts money from the balance."""
+        """
+        Create an order IPv6. Attention! Deducts money from the balance.
+
+        Аргументы как у orderCalcIpv6(): countryId и periodId принимают ObjectId ЛИБО код,
+        customTargetName обязателен.
+        """
         return self.orderMake(self.withGenerateAuth(self.prepareIpv6(
             countryId, periodId, quantity, authorization, coupon, customTargetName, protocol,
             self._order_options(options, order_options))))
@@ -758,13 +908,22 @@ class Api:
     def orderMakeMobile(self, countryId=None, periodId=None, quantity=None, authorization=None,
                         coupon=None, operatorId=None, rotationId=None,
                         mobileServiceType='dedicated', options=None, **order_options):
-        """Create a mobile order. Attention! Deducts money from the balance."""
+        """
+        Create a mobile order. Attention! Deducts money from the balance.
+
+        Аргументы как у orderCalcMobile(): countryId / periodId / operatorId принимают
+        ObjectId ЛИБО код, rotationId — ЧИСЛО МИНУТ (0 = "By Link"), кодов у него нет.
+        """
         return self.orderMake(self.withGenerateAuth(self.prepareMobile(
             countryId, periodId, quantity, authorization, coupon, operatorId, rotationId,
             mobileServiceType, self._order_options(options, order_options))))
 
     def orderMakeResident(self, tarifId=None, coupon=None, options=None, **order_options):
-        """Create an order Resident. Attention! Deducts money from the balance."""
+        """
+        Create an order Resident. Attention! Deducts money from the balance.
+
+        tarifId — ObjectId резидентского тарифа ЛИБО его code.
+        """
         return self.orderMake(self.prepareResident(
             tarifId, coupon, self._order_options(options, order_options)))
 
@@ -800,8 +959,12 @@ class Api:
         Args:
             type (str): The type of the order - ipv4, ipv6, mobile, isp, mix or mix_isp.
             ids (list): A list of identifiers proxy (ObjectId-СТРОКИ).
-            periodId (str): Period id (ObjectId-строка; либо periodCode в options).
+            periodId (str): ObjectId периода ЛИБО код периода ('1m') — у prolong тот же
+                серверный фолбэк, что у order (normalizeProlongReferenceCodes), поэтому
+                periodCode передавать не обязательно.
             coupon (str): Coupon code.
+            options: paymentId (ObjectId ЛИБО код платёжной системы, например 'balance'),
+                orderSeparatorId / orderSeparatorIds, ids.
 
         Returns:
             dict: The response from the endpoint.
@@ -817,8 +980,10 @@ class Api:
         Args:
             type (str): The type of the order - ipv4, ipv6, mobile, isp, mix or mix_isp.
             ids (list): A list of identifiers proxy (ObjectId-СТРОКИ).
-            periodId (str): Period id (ObjectId-строка; либо periodCode в options).
+            periodId (str): ObjectId периода ЛИБО код периода ('1m'), см. prolongCalc().
             coupon (str): Coupon code.
+            options: paymentId (ObjectId ЛИБО код платёжной системы), orderSeparatorId /
+                orderSeparatorIds, ids.
 
         Returns:
             dict: {'orderId': ObjectId-строка, 'total', 'balance', 'listBaseOrderNumbers'}.
