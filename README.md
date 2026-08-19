@@ -15,20 +15,43 @@ not into a header.
 from proxy_seller_user_api import Api, ApiError
 
 try:
-    with Api({
-        'key': 'YOUR_API_KEY',
-        # Optional root before the API key (useful for local/dev environments):
-        'base_url': 'https://proxy-seller.com/personal/api/v2/',
-        'timeout': 30,
-        'headers': {'X-Request-Source': 'my-app'},
-    }) as api:
+    with Api({'key': 'YOUR_API_KEY', 'timeout': 30}) as api:
         print(api.balance())
 except ApiError as error:
     print(error.code, error.custom_data, error.http_status, error.errors)
 ```
 
-Call `api.close()` when a context manager is not used. Configuration and payment/
+Nothing else is required — the client talks to `https://proxy-seller.com/personal/api/v2/` by
+default. Call `api.close()` when a context manager is not used. Configuration and payment/
 authorization state belong to each `Api` instance; they are not shared by clients.
+
+### Paying for orders
+
+Every order and renewal needs a payment system. Take one from `balancePaymentsList()` and set it
+once:
+
+```python
+payments = api.balancePaymentsList()   # [{'id': '69e7…', 'name': 'PayPal'}, …]
+api.setPaymentId(payments[0]['id'])
+```
+
+This is the one place where an id is unavoidable: several payment systems share the same internal
+code (a single `cryptomus` covers "USDT (TRC-20)", "All cryptocurrencies" and more), so the code
+cannot tell them apart. Everywhere else you use human-readable codes.
+
+<details>
+<summary>Pointing the client at another host, and extra headers</summary>
+
+```python
+with Api({
+    'key': 'YOUR_API_KEY',
+    'base_url': 'http://localhost:7995/personal/api/v2/',
+    'headers': {'X-Request-Source': 'my-app'},
+}) as api:
+    ...
+```
+
+</details>
 
 ## Errors
 
@@ -100,16 +123,22 @@ is only copied into `rotationId` after an integer check. Use `rotationId` and fo
 
 ### What can be passed and where to get it
 
-| Argument | Accepts | Available from `referenceList()`? |
+`referenceList()` gives you a readable code for every field. Read it, pass the code straight into
+the argument — there is no id to look up:
+
+| Argument | Pass this | Read it from |
 | --- | --- | --- |
-| `countryId` | country ObjectId, or the alpha3 code (uppercased before lookup, so `usa` == `USA`) | **Yes** — `country[].alpha3` next to `country[].id` |
-| `periodId` | period ObjectId, or the period code (lowercased, e.g. `1m`) | **No** — `period[]` only carries `id` and `name` (`"1 month"`). Take `id`, or use a code you already know |
-| `operatorId` | mobile operator ObjectId, or its tag (used **as is**, case-sensitive) | **Not as a separate field** — take `country[].operators.dedicated[].id` / `.shared[].id` and pass it unchanged; depending on the data source that value is already either the id or the tag, and both resolve |
-| `rotationId` | **minutes** as an integer, `0` = `By Link`. No codes exist | **Yes** — `country[].operators.*[].rotations[].id` *is* the minute value |
-| `mixId` | mix package ObjectId, or its tag (exact match) | **Yes, for `mix`/`mix_isp`** — `country[].tag` (for example `usa-europe-mix_IPv4`); `quantities[]` gives `id`/`name`/`quantities` without a tag |
-| `tarifId` | resident tariff ObjectId, or its code (exact match) | **No** — `tarifs[]` returns `id`, `name`, `personal`. Take `id` |
-| `paymentId` in `order/*`, `prolong/*` | payment-system ObjectId, its code, or a payment type name (`balance`) | **No** — `balancePaymentsList()` returns `id` and `name`. Take `id`, or use a known code |
-| `paymentId` in `balance/add` | **ObjectId only** — this endpoint does not resolve codes (see `balanceAdd`) | — |
+| `countryId` | alpha-3 country code, e.g. `USA` (upper-cased server-side, so `usa` works) | `country[].alpha3` |
+| `periodId` | period code, e.g. `1m` (lower-cased server-side) | `period[].code` |
+| `operatorId` | mobile operator tag — exact match, case-sensitive | `reference/list/mobile` → `country[].operators.dedicated[]` / `.shared[]` → `tag` |
+| `rotationId` | **minutes** as an integer, `0` = `By Link`. The one field with no code | `country[].operators.*[].rotations[].id` *is* the minute value |
+| `mixId` | mix package code — exact match | `reference/list/mix` → `quantities[].tag`, e.g. `europe-2-mix_IPv4`. First argument of `orderCalcMix()`/`orderMakeMix()` |
+| `tarifId` | resident tariff code — exact match, e.g. `1-gb` | `reference/list/resident` → `tarifs[].code` |
+| `paymentId` | payment-system ObjectId — the one unavoidable id | `balancePaymentsList()` → `id`, see "Paying for orders" above |
+
+ObjectIds are still accepted everywhere if you happen to have them; the reference simply no longer
+publishes them. `balance/add` is the one endpoint that resolves no codes at all — it needs a real
+`paymentId` (see `balanceAdd`).
 
 ## Orders
 
@@ -148,23 +177,53 @@ positionally.
 
 `customTargetName` is required for `ipv4`, `ipv6` and `isp` (the server answers
 `Incorrect goal`, code 14, without it) and is checked locally before the request. For
-`mix`/`mix_isp` it is not required once the package is resolved — by `mixId`/`mixCode`, by
-`countryId='PACKAGE_ID:QUANTITY'`, or by `countryId='PACKAGE_ID'` plus `quantity > 0`.
+`mix`/`mix_isp` it is only needed when the server cannot tell which package you mean, so naming
+the package — `orderCalcMix('europe-2-mix_IPv4', '1m', 10)` — removes the need for it.
 
-## Prolongation
+## Renewing proxies
 
-The object/keyword form exposes the complete v2 payload: `ids`,
-`orderSeparatorId`, `orderSeparatorIds`, `periodId`, `paymentId`, and `coupon`. Types: `ipv4`,
-`ipv6`, `mobile`, `isp`, `mix`, `mix_isp`. Here too `periodId` and `paymentId` accept a code
-instead of an ObjectId, so `periodCode`/`paymentCode` are never required.
+Renew by the addresses themselves — the same strings `proxyList()` gives you. No ids to look up:
+
+```python
+ipv4 = api.proxyList('ipv4')['items']
+ips = [item['ip'] for item in ipv4]          # ['1.2.3.4', '5.6.7.8']
+
+api.prolongCalc('ipv4', ips, '1m')           # price first
+api.prolongMake('ipv4', ips, '1m')           # deducts money
+```
+
+`prolongCalc()` shows the price; `prolongMake()` charges the balance. If the balance is short,
+`prolongMake()` raises `ApiError` with the server's warning — it never reports a renewal that did
+not happen.
+
+The address format follows the proxy type, exactly as `proxyList()` returns it:
+
+| type | address |
+|---|---|
+| `ipv4`, `isp`, `mix` | `1.2.3.4` |
+| `ipv6` | `host:port` |
+| `mobile` | `ip:portHttp:portSocks` |
+
+ObjectId strings work too, and a mixed list works — each value is routed by its shape. The period
+takes a code (`'1m'`), same fallback as `order/*`, and the fourth argument is a coupon.
+
+<details>
+<summary>Renewing part of a MIX order</summary>
+
+A MIX order can be split into parts that renew independently. Those parts are addressed by id,
+passed as keywords:
 
 ```python
 api.prolongMake(
     'mix', orderSeparatorIds=['SEPARATOR_ID'],
-    periodId='1m', paymentId='balance', coupon='SALE10')
-
-api.prolongCalc('ipv4', ['ORDER_ID'], '3m')
+    periodId='1m', coupon='SALE10')
 ```
+
+The keyword form also exposes the complete v2 payload: `ips`, `ids`, `orderSeparatorId`,
+`orderSeparatorIds`, `periodId`, `paymentId`, and `coupon`. Types: `ipv4`, `ipv6`, `mobile`,
+`isp`, `mix`, `mix_isp`.
+
+</details>
 
 ## Balance and auto top-up
 

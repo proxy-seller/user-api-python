@@ -929,19 +929,58 @@ class Api:
 
     # --------------------------- Prolong ---------------------------
 
+    @staticmethod
+    def _splitProlongTargets(ipsOrIds):
+        """
+        Разводит то, что пришло от вызывающего, на адреса и ObjectId.
+
+        Клиенту удобнее продлевать по самим адресам — именно их он видит в proxy/list.
+        Сервер принимает их в поле ips и сам переводит в ids
+        (ClientApiService.resolveProlongIpsToIds — безусловно и для calc, и для make).
+        Адрес содержит точку или двоеточие (ipv4 "ip", ipv6 "host:port", mobile
+        "ip:portHttp:portSocks"), ObjectId — 24 hex-символа без них, так что
+        смешанный список тоже работает.
+        """
+        ips, ids = [], []
+        if isinstance(ipsOrIds, str):
+            items = ipsOrIds.split(',')
+        elif isinstance(ipsOrIds, (list, tuple, set)):
+            items = list(ipsOrIds)
+        else:
+            return ips, ids
+        for item in items:
+            if not isinstance(item, str):
+                ids.append(item)
+                continue
+            value = item.strip()
+            if not value:
+                continue
+            (ips if ('.' in value or ':' in value) else ids).append(value)
+        return ips, ids
+
     def prepareProlong(self, ids=None, periodId=None, coupon='', options=None):
         if isinstance(ids, dict):
             payload = self.paymentOptions()
             values = {**ids, **(options or {})}
         else:
+            routed = {}
+            targetIps, targetIds = self._splitProlongTargets(ids)
+            if targetIps or targetIds:
+                # Пустой ids рядом с ips не ставим: сервер отдаёт приоритет ids.
+                if targetIds:
+                    routed['ids'] = targetIds
+                if targetIps:
+                    routed['ips'] = targetIps
+            elif ids is not None:
+                routed['ids'] = ids
             payload = {
-                **self.paymentOptions(), 'ids': ids,
+                **self.paymentOptions(), **routed,
                 'periodId': periodId, 'coupon': coupon}
             values = options or {}
         if not isinstance(values, dict):
             raise TypeError('prolong options must be a dict')
         for key in (
-                'ids', 'orderSeparatorIds', 'orderSeparatorId', 'coupon',
+                'ids', 'ips', 'orderSeparatorIds', 'orderSeparatorId', 'coupon',
                 'periodId', 'periodCode', 'paymentId', 'paymentCode'):
             if key in values:
                 payload[key] = values[key]
@@ -958,7 +997,10 @@ class Api:
 
         Args:
             type (str): The type of the order - ipv4, ipv6, mobile, isp, mix or mix_isp.
-            ids (list): A list of identifiers proxy (ObjectId-СТРОКИ).
+            ids (list): сами адреса, ровно в том виде, в каком их отдаёт proxy/list:
+                '1.2.3.4' для ipv4/isp/mix, 'host:port' для ipv6, 'ip:portHttp:portSocks' для
+                mobile. ObjectId-строки тоже принимаются, смешанный список работает —
+                каждое значение раскладывается по форме (_splitProlongTargets).
             periodId (str): ObjectId периода ЛИБО код периода ('1m') — у prolong тот же
                 серверный фолбэк, что у order (normalizeProlongReferenceCodes), поэтому
                 periodCode передавать не обязательно.
@@ -979,7 +1021,7 @@ class Api:
 
         Args:
             type (str): The type of the order - ipv4, ipv6, mobile, isp, mix or mix_isp.
-            ids (list): A list of identifiers proxy (ObjectId-СТРОКИ).
+            ids (list): сами адреса из proxy/list ЛИБО ObjectId-строки, см. prolongCalc().
             periodId (str): ObjectId периода ЛИБО код периода ('1m'), см. prolongCalc().
             coupon (str): Coupon code.
             options: paymentId (ObjectId ЛИБО код платёжной системы), orderSeparatorId /

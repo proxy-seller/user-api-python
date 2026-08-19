@@ -468,5 +468,60 @@ class DocumentedOrderExamplesTest(unittest.TestCase):
             'paymentId': 'balance', 'coupon': 'SALE10'})
 
 
+class ProlongByAddressTest(unittest.TestCase):
+    """
+    Продление по самим адресам: их клиент видит в proxy/list, ObjectId — нет.
+    Сервер при наличии ids игнорирует ips, поэтому пустой ids рядом с ips недопустим.
+    """
+
+    def test_addresses_go_into_ips(self):
+        api, session = make_api([envelope({'orderId': '68b1f0c4e13a4c0f1a2b3c4d'})])
+        api.prolongMake('ipv4', ['1.2.3.4', '5.6.7.8'], '1m')
+        self.assertEqual(session.last['json'], {
+            'ips': ['1.2.3.4', '5.6.7.8'], 'periodId': '1m', 'coupon': ''})
+        self.assertNotIn('ids', session.last['json'])
+
+    def test_objectids_go_into_ids(self):
+        api, session = make_api([envelope({'orderId': '68b1f0c4e13a4c0f1a2b3c4d'})])
+        api.prolongMake('ipv4', ['68b1f0c4e13a4c0f1a2b3c4d'], '1m')
+        self.assertEqual(session.last['json'], {
+            'ids': ['68b1f0c4e13a4c0f1a2b3c4d'], 'periodId': '1m', 'coupon': ''})
+        self.assertNotIn('ips', session.last['json'])
+
+    def test_mixed_list_is_routed_by_shape(self):
+        api, session = make_api([envelope({'total': 1})])
+        api.prolongCalc('ipv4', ['1.2.3.4', '68b1f0c4e13a4c0f1a2b3c4d'], '1m')
+        self.assertEqual(session.last['json'], {
+            'ids': ['68b1f0c4e13a4c0f1a2b3c4d'], 'ips': ['1.2.3.4'],
+            'periodId': '1m', 'coupon': ''})
+
+    def test_ipv6_and_mobile_formats_are_addresses(self):
+        api, session = make_api([envelope({'total': 1})])
+        api.prolongCalc('ipv6', ['2001:db8::1:8080', '10.0.0.1:8000:9000'], '1m')
+        self.assertEqual(session.last['json']['ips'],
+                         ['2001:db8::1:8080', '10.0.0.1:8000:9000'])
+
+    def test_comma_string_and_blanks(self):
+        api, session = make_api([envelope({'total': 1})])
+        api.prolongCalc('ipv4', '1.2.3.4, 5.6.7.8 ,  ', '1m')
+        self.assertEqual(session.last['json']['ips'], ['1.2.3.4', '5.6.7.8'])
+
+
+class OrderMixIdentifierTest(unittest.TestCase):
+    """
+    Код MIX-пакета должен уезжать в mixId: parseMixSelection ищет пакет через
+    findById(mixId), а тег в ObjectId переводит normalizeOrderReferenceCodes — тоже только
+    для mixId.
+    """
+
+    def test_package_code_goes_into_mix_id(self):
+        api, session = make_api([envelope({'total': 10})])
+        api.orderCalcMix('europe-2-mix_IPv4', '1m', 10)
+        self.assertEqual(session.last['json'], {
+            'sectionCode': 'mix', 'mixId': 'europe-2-mix_IPv4',
+            'periodId': '1m', 'quantity': 10})
+        self.assertNotIn('countryId', session.last['json'])
+
+
 if __name__ == '__main__':
     unittest.main()
