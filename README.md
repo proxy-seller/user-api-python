@@ -123,17 +123,17 @@ is only copied into `rotationId` after an integer check. Use `rotationId` and fo
 
 ### What can be passed and where to get it
 
-`referenceList()` gives you a readable code for every field. Read it, pass the code straight into
-the argument — there is no id to look up:
+Every field in `referenceList()` is called `id`, and its value is a readable code — not an
+ObjectId. Read `id`, put it in the matching `*Id` argument. That is the whole rule:
 
 | Argument | Pass this | Read it from |
 | --- | --- | --- |
-| `countryId` | alpha-3 country code, e.g. `USA` (upper-cased server-side, so `usa` works) | `country[].alpha3` |
-| `periodId` | period code, e.g. `1m` (lower-cased server-side) | `period[].code` |
-| `operatorId` | mobile operator tag — exact match, case-sensitive | `reference/list/mobile` → `country[].operators.dedicated[]` / `.shared[]` → `tag` |
-| `rotationId` | **minutes** as an integer, `0` = `By Link`. The one field with no code | `country[].operators.*[].rotations[].id` *is* the minute value |
-| `mixId` | mix package code — exact match | `reference/list/mix` → `quantities[].tag`, e.g. `europe-2-mix_IPv4`. First argument of `orderCalcMix()`/`orderMakeMix()` |
-| `tarifId` | resident tariff code — exact match, e.g. `1-gb` | `reference/list/resident` → `tarifs[].code` |
+| `countryId` | alpha-3 country code, e.g. `USA` (upper-cased server-side, so `usa` works) | `country[].id` |
+| `periodId` | period code, e.g. `1m` (lower-cased server-side) | `period[].id` |
+| `operatorId` | mobile operator code — exact match, case-sensitive | `reference/list/mobile` → `country[].operators.dedicated[]` / `.shared[]` → `id` |
+| `rotationId` | **minutes** as an integer, `0` = `By Link` — the one `id` that is a number, not a code | `country[].operators.*[].rotations[].id` *is* the minute value |
+| `mixId` | mix package code — exact match | `reference/list/mix` → `quantities[].id`, e.g. `europe-2-mix_IPv4`. First argument of `orderCalcMix()`/`orderMakeMix()` |
+| `tarifId` | resident tariff code — exact match, e.g. `1-gb` | `reference/list/resident` → `tarifs[].id` |
 | `paymentId` | payment-system ObjectId — the one unavoidable id | `balancePaymentsList()` → `id`, see "Paying for orders" above |
 
 ObjectIds are still accepted everywhere if you happen to have them; the reference simply no longer
@@ -156,12 +156,12 @@ api.orderCalcMobile('USA', '1m', 1, operatorId='ee_unitedkingdom', rotationId=5)
 api.orderMakeMobile('USA', '1m', 1, operatorId='ee_unitedkingdom', rotationId=10,
                     mobileServiceType='dedicated')
 
-# MIX: the first argument is a package, not a country — ObjectId or the tag from
-# referenceList()['mix']['country'][0]['tag']
-api.orderCalcMix('usa-europe-mix_IPv4', '1m', 1)
+# MIX: the first argument is a package, not a country — take it from
+# referenceList()['mix']['quantities'][0]['id']
+api.orderCalcMix('europe-2-mix_IPv4', '1m', 1)
 
-# resident: a tariff (ObjectId or code) and an optional coupon
-api.orderCalcResident('TARIF_ID')
+# resident: a tariff code from referenceList('resident')['tarifs'][0]['id']
+api.orderCalcResident('1-gb')
 ```
 
 The whole payload may still be passed as one dictionary (`api.orderCalcMobile({...})`) or as

@@ -725,11 +725,10 @@ class Api:
         Calculate IPv4.
 
         Args:
-            countryId (str): ObjectId страны ЛИБО её код — alpha3 из reference/list
-                (country[].alpha3, например 'USA'; сервер приводит к верхнему регистру).
-            periodId (str): ObjectId периода ЛИБО код периода (например '1m'; сервер
-                приводит к нижнему регистру). Кода периода в reference/list нет — там только
-                id и name, так что либо берите id, либо используйте известный вам код.
+            countryId (str): код страны alpha3 из reference/list → country[].id
+                (например 'USA'; сервер приводит к верхнему регистру). ObjectId тоже принимается.
+            periodId (str): код периода из reference/list → period[].id (например '1m';
+                сервер приводит к нижнему регистру). ObjectId тоже принимается.
             quantity (int): Количество прокси.
             authorization (str): Необязательно.
             coupon (str): Необязательно.
@@ -762,9 +761,9 @@ class Api:
         Calculate MIX. The first argument is a MIX package, not a country.
 
         Args:
-            mixId (str): ObjectId mix-пакета ЛИБО его tag (точное совпадение). tag есть в
-                reference/list: mix/mix_isp -> country[].tag (например
-                'usa-europe-mix_IPv4'); в quantities[] его нет.
+            mixId (str): код mix-пакета (точное совпадение) из reference/list:
+                mix/mix_isp -> quantities[].id (например 'europe-2-mix_IPv4') — рядом же
+                доступные количества. ObjectId тоже принимается.
             periodId (str): ObjectId периода ЛИБО код периода ('1m').
             quantity (int): Количество прокси в пакете (из quantities[].quantities).
             customTargetName (str): Для mix не требуется, если пакет распознан
