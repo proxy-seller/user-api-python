@@ -936,8 +936,9 @@ class Api:
         Клиенту удобнее продлевать по самим адресам — именно их он видит в proxy/list.
         Сервер принимает их в поле ips и сам переводит в ids
         (ClientApiService.resolveProlongIpsToIds — безусловно и для calc, и для make).
-        Адрес содержит точку или двоеточие (ipv4 "ip", ipv6 "host:port", mobile
-        "ip:portHttp:portSocks"), ObjectId — 24 hex-символа без них, так что
+        Адрес содержит точку или двоеточие (ipv4/isp/mix "ip", ipv6 "host:port" —
+        в поле "ip" уже лежат шлюз и порт, а в "ip_only" — один шлюз, mobile
+        "ip:port_http:port_socks"), ObjectId — 24 hex-символа без них, так что
         смешанный список тоже работает.
         """
         ips, ids = [], []
@@ -997,9 +998,11 @@ class Api:
         Args:
             type (str): The type of the order - ipv4, ipv6, mobile, isp, mix or mix_isp.
             ids (list): сами адреса, ровно в том виде, в каком их отдаёт proxy/list:
-                '1.2.3.4' для ipv4/isp/mix, 'host:port' для ipv6, 'ip:portHttp:portSocks' для
-                mobile. ObjectId-строки тоже принимаются, смешанный список работает —
-                каждое значение раскладывается по форме (_splitProlongTargets).
+                '1.2.3.4' (поле 'ip') для ipv4/isp/mix/mix_isp, '1.2.3.4:26000' (тоже поле
+                'ip': у ipv6 в нём уже лежат шлюз и порт, а в 'ip_only' — один шлюз),
+                'ip:port_http:port_socks' для mobile. ObjectId-строки принимаются
+                для любого типа, смешанный список работает — каждое значение
+                раскладывается по форме (_splitProlongTargets).
             periodId (str): ObjectId периода ЛИБО код периода ('1m') — у prolong тот же
                 серверный фолбэк, что у order (normalizeProlongReferenceCodes), поэтому
                 periodCode передавать не обязательно.

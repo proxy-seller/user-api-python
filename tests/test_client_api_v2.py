@@ -495,11 +495,21 @@ class ProlongByAddressTest(unittest.TestCase):
             'ids': ['68b1f0c4e13a4c0f1a2b3c4d'], 'ips': ['1.2.3.4'],
             'periodId': '1m', 'coupon': ''})
 
-    def test_ipv6_and_mobile_formats_are_addresses(self):
+    def test_mobile_address_with_colons_is_an_address(self):
+        """mobile: 'ip:port_http:port_socks' — двоеточия не мешают попасть в ips."""
         api, session = make_api([envelope({'total': 1})])
-        api.prolongCalc('ipv6', ['2001:db8::1:8080', '10.0.0.1:8000:9000'], '1m')
-        self.assertEqual(session.last['json']['ips'],
-                         ['2001:db8::1:8080', '10.0.0.1:8000:9000'])
+        api.prolongCalc('mobile', ['10.0.0.1:8000:9000'], '1m')
+        self.assertEqual(session.last['json']['ips'], ['10.0.0.1:8000:9000'])
+
+    def test_ipv6_address_is_the_ip_field_with_port(self):
+        """
+        ipv6: в поле 'ip' из proxy/list уже лежат шлюз и порт ('1.2.3.4:26000'),
+        в 'ip_only' — один шлюз; двоеточие увозит адрес в ips как есть.
+        """
+        api, session = make_api([envelope({'total': 1})])
+        api.prolongCalc('ipv6', ['1.2.3.4:26000'], '1m')
+        self.assertEqual(session.last['json']['ips'], ['1.2.3.4:26000'])
+        self.assertNotIn('ids', session.last['json'])
 
     def test_comma_string_and_blanks(self):
         api, session = make_api([envelope({'total': 1})])

@@ -196,16 +196,29 @@ api.prolongMake('ipv4', ips, '1m')           # deducts money
 `prolongMake()` raises `ApiError` with the server's warning — it never reports a renewal that did
 not happen.
 
-The address format follows the proxy type, exactly as `proxyList()` returns it:
+What to pass follows the proxy type, and every value comes straight out of `proxyList()`:
 
-| type | address |
-|---|---|
-| `ipv4`, `isp`, `mix` | `1.2.3.4` |
-| `ipv6` | `host:port` |
-| `mobile` | `ip:portHttp:portSocks` |
+| type | pass this | built from |
+|---|---|---|
+| `ipv4`, `isp`, `mix`, `mix_isp` | the address, `1.2.3.4` | `item['ip']` |
+| `ipv6` | the address, `host:port` — `1.2.3.4:26000` | `item['ip']` |
+| `mobile` | the address, `ip:port_http:port_socks` | `item['ip']`, `item['port_http']`, `item['port_socks']` |
 
-ObjectId strings work too, and a mixed list works — each value is routed by its shape. The period
-takes a code (`'1m'`), same fallback as `order/*`, and the fourth argument is a coupon.
+For `ipv6` the `ip` field already carries the gateway together with the port
+(`1.2.3.4:26000`), while `ip_only` holds the bare gateway — what the API publishes is the
+gateway, not the IPv6 address itself. So `ip` is passed as it comes, exactly like every other
+type; only `mobile` has to be assembled, out of the three fields above:
+
+```python
+mobile = api.proxyList('mobile')['items']
+addresses = ['{}:{}:{}'.format(item['ip'], item['port_http'], item['port_socks'])
+             for item in mobile]
+api.prolongCalc('mobile', addresses, '1m')
+```
+
+ObjectId strings work for every type, and a mixed list works — each value is routed by its shape
+(an id is 24 hex characters, with no dot and no colon, so it goes into `ids` on its own). The
+period takes a code (`'1m'`), same fallback as `order/*`, and the fourth argument is a coupon.
 
 <details>
 <summary>Renewing part of a MIX order</summary>
