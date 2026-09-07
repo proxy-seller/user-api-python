@@ -39,6 +39,27 @@ This is the one place where an id is unavoidable: several payment systems share 
 code (a single `cryptomus` covers "USDT (TRC-20)", "All cryptocurrencies" and more), so the code
 cannot tell them apart. Everywhere else you use human-readable codes.
 
+### Residential and scraper orders need a fingerprint
+
+`order/make` carries an `X-Fingerprint` header. Most sections ignore it, but **residential and
+scraper orders are not created without it at all** — the order service answers `Header
+X-Fingerprint is required` and nothing is ordered.
+
+```python
+api = Api({'key': 'YOUR_API_KEY', 'fingerprint': 'my-installation-id'})
+# or later:
+api.setFingerprint('my-installation-id')
+# or for a single call:
+api.orderMakeResident('1-gb', fingerprint='my-installation-id')
+```
+
+Any opaque string is accepted — the server does not validate its shape — but it must be a
+**stable identifier of your installation**. The SDK deliberately does not generate one: a value
+randomized per process would break the anti-fraud and affiliate attribution the header exists for.
+
+Ordering resident or scraper without a fingerprint raises `ValueError` locally, rather than
+spending a round trip on a request the server is certain to reject.
+
 <details>
 <summary>Pointing the client at another host, and extra headers</summary>
 
@@ -160,7 +181,8 @@ api.orderMakeMobile('USA', '1m', 1, operatorId='ee_unitedkingdom', rotationId=10
 # referenceList()['mix']['quantities'][0]['id']
 api.orderCalcMix('europe-2-mix_IPv4', '1m', 1)
 
-# resident: a tariff code from referenceList('resident')['tarifs'][0]['id']
+# resident: a tariff code from referenceList('resident')['items']['tarifs'][0]['id']
+#           (the typed call wraps its single entry in 'items' — the untyped one does not)
 api.orderCalcResident('1-gb')
 ```
 
@@ -238,6 +260,44 @@ The keyword form also exposes the complete v2 payload: `ips`, `ids`, `orderSepar
 
 </details>
 
+## Automatic renewal
+
+`prolongMake()` charges you now. `autoprolong/*` only arms a charge that happens later, without
+you present — a separate branch of the API, not a flag on prolong.
+
+```python
+api.autoProlongCalc('ipv4', ['1.2.3.4'], '1m', paymentId='balance')
+api.autoProlongEnable('ipv4', ['1.2.3.4'], '1m', paymentId='balance')
+api.autoProlongDisable('ipv4', ['1.2.3.4'])
+```
+
+`paymentId` is **mandatory** for `calc` and `enable` — the charge happens while you are away, so
+the payment system cannot be guessed. Only `balance` and `paddle_subscription` are accepted: a
+one-off Paddle checkout needs a browser redirect a headless client cannot complete. With
+`paddle_subscription` also pass `subscriptionId`.
+
+Residential packages renew as a package, not as addresses — send no selection:
+
+```python
+api.autoProlongCalc('resident', paymentId='balance')
+api.autoProlongEnable('resident', paymentId='balance', tarifId='trial')
+api.autoProlongDisable('resident')
+```
+
+Three things about the answers before you parse them:
+
+* **`ids` is not an echo.** For `ipv6` the whole order is switched at once, so `quantity` and
+  `ids` can cover more proxies than you sent.
+* **Not enough money is not an exception.** `calc` answers `status: "error"` with a *filled*
+  `data` and an empty `errors[]` — the same shape `prolong/calc` uses. Read `data['warning']`.
+* **Residential fills different fields.** `days` and `chargeDate` are `None` there (a package
+  renews on expiry *or* on traffic exhaustion, so no single date describes it); `tarifId` and
+  `dateEnd` carry the meaning instead.
+
+`scraper` has no auto-renewal: it is extended by buying traffic through `order/make`.
+
+> Replaces `resident/autorenew/{enable,disable,calculate}`, **removed** from the server.
+
 ## Balance and auto top-up
 
 ```python
@@ -252,12 +312,12 @@ resolve `paymentCode`. Passing a code alone raises a local `ValueError` instead 
 ```python
 state = api.balanceAutoTopupGet()
 # {'configured': True, 'enabled': True, 'state': 'ACTIVE', 'threshold': 10, 'amount': 25,
-#  'subscriptionId': 'sub_1', 'paymentMethod': {...}, 'dailyCountCap': 3,
-#  'monthlyAmountCap': 300, 'failCount': 0, 'lastAttemptAt': None, 'lastEvent': None}
+#  'subscriptionId': 'sub_1', 'paymentMethod': {...},
+#  'failCount': 0, 'lastAttemptAt': None, 'lastEvent': None}
 
 api.balanceAutoTopupSet(threshold=20)                    # partial update: only threshold
 api.balanceAutoTopupSet(enabled=False)                   # False is sent, not dropped
-api.balanceAutoTopupSet({'amount': 50, 'dailyCountCap': 2})
+api.balanceAutoTopupSet({'amount': 50})
 ```
 
 `state` is one of `NO_PAYMENT_METHOD`, `DISABLED`, `ACTIVE`, `PAYMENT_INVALID`,
@@ -271,9 +331,14 @@ value, so the library sends only the fields you actually gave it. Both calls ret
 after saving — no second request needed. Validation is entirely server-side and applied to
 the merged result; error codes are `49` (feature unavailable), `50` (threshold too low),
 `51` (amount too low), `52` (amount below threshold), `53` (no saved payment method),
-`54` (daily cap too low), `55` (monthly cap below one top-up), `56` (saved card expired).
-Boundary values arrive in `error.custom_data`: `minAmount`, `minThreshold`,
-`minDailyCountCap`.
+`56` (saved card expired). Boundary values arrive in `error.custom_data`: `minAmount`
+and `minThreshold`.
+
+> **`dailyCountCap` and `monthlyAmountCap` are gone.** Removed from the contract on 2026-08-18:
+> the server silently ignores them and they are absent from the response, so passing them made a
+> call that reported success and changed nothing. The SDK now raises `ValueError` on them. Codes
+> `54` and `55` were removed with them and are not reused, and `custom_data` no longer carries
+> `minDailyCountCap`.
 
 ## Proxies
 
@@ -360,6 +425,29 @@ api.residentSubUserListDelete('PACKAGE_KEY', 561)  # {'status': 'delete'} | {'st
 - `balanceAdd()` uses its explicit `paymentId`, then falls back to `setPaymentId()`;
   `paymentCode` is not accepted here.
 - `proxy/replace` takes the replacement reason in `type`, plus `comment` for `CUSTOM`.
+
+## Keeping up with the server
+
+Changes made after the 2.0 release, in the order the server shipped them:
+
+- **`resident/autorenew/{enable,disable,calculate}` were removed** and replaced by
+  `autoprolong/{calc,enable,disable}/{type}` — see [Automatic renewal](#automatic-renewal).
+  `type='resident'` is the residential branch of the same three endpoints.
+- **`order/make` requires `X-Fingerprint`** for residential and scraper orders. The SDK can now
+  send it; without a value those two sections raise locally instead of being rejected by the
+  server.
+- **`dailyCountCap` / `monthlyAmountCap` were removed** from `balance/autotopup/set`
+  (2026-08-18). The server ignores them, so the SDK now raises `ValueError` rather than letting
+  the call look successful while changing nothing. Error codes 54 and 55 are gone with them.
+- **`*Code` no longer overrides a paired `*Id`** for `mixId`, `operatorId`, `rotationId` and
+  `tarifId`. The server gives the *id* priority on those four, and the SDK was inverting it.
+- **`generateAuth`, `highAvailability` and `isUptime` are no longer dropped.** They were missing
+  from the internal whitelist, so passing them to an order helper silently lost the value —
+  `generateAuth` was then overwritten by `setGenerateAuth()` (default `'N'`).
+- **`prolongMake()` no longer second-guesses the envelope.** Insufficient funds now arrive as
+  `errors[{code: 16}]` and raise like any other business error; a legitimate success with an
+  empty `orderId` is returned intact instead of being turned into a false failure after the
+  money has already been taken.
 
 ## Tests
 

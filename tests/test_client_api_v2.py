@@ -150,7 +150,7 @@ class AutoTopupTest(unittest.TestCase):
         'threshold': 10, 'amount': 25, 'subscriptionId': 'sub_1',
         'paymentMethod': {'id': 'sub_1', 'status': 'active', 'paymentMethod': 'card',
                           'brand': 'visa', 'last4': '4242', 'exp': '01/2030'},
-        'dailyCountCap': 3, 'monthlyAmountCap': 300, 'failCount': 0,
+        'failCount': 0,
         'lastAttemptAt': None, 'lastEvent': None,
     }
 
@@ -169,17 +169,24 @@ class AutoTopupTest(unittest.TestCase):
 
     def test_false_and_zero_are_not_dropped(self):
         api, session = make_api([envelope(self.STATE)])
-        api.balanceAutoTopupSet(enabled=False, dailyCountCap=0)
-        self.assertEqual(session.last['json'], {'enabled': False, 'dailyCountCap': 0})
+        api.balanceAutoTopupSet(enabled=False, threshold=0)
+        self.assertEqual(session.last['json'], {'enabled': False, 'threshold': 0})
 
     def test_full_payload(self):
         api, session = make_api([envelope(self.STATE)])
         api.balanceAutoTopupSet(
-            enabled=True, threshold=10, amount=25, subscriptionId='sub_1',
-            dailyCountCap=3, monthlyAmountCap=300)
+            enabled=True, threshold=10, amount=25, subscriptionId='sub_1')
         self.assertEqual(session.last['json'], {
-            'enabled': True, 'threshold': 10, 'amount': 25, 'subscriptionId': 'sub_1',
-            'dailyCountCap': 3, 'monthlyAmountCap': 300})
+            'enabled': True, 'threshold': 10, 'amount': 25, 'subscriptionId': 'sub_1'})
+
+    def test_removed_caps_are_rejected_locally(self):
+        """Сервер эти поля молча игнорирует (убраны 18.08.2026), так что отправить их —
+        значит получить success, не изменивший ничего. Отбиваем до запроса."""
+        api, session = make_api([envelope(self.STATE)])
+        for field in ('dailyCountCap', 'monthlyAmountCap'):
+            with self.assertRaises(ValueError):
+                api.balanceAutoTopupSet(**{field: 3})
+        self.assertEqual(session.calls, [])
 
     def test_dict_form_drops_none(self):
         api, session = make_api([envelope(self.STATE)])
@@ -331,7 +338,10 @@ class ErrorEnvelopeTest(unittest.TestCase):
         self.assertTrue(error.isAccessError())
 
     def test_business_error_is_not_access_error(self):
-        api, _ = make_api([error_envelope([{'message': 'Incorrect goal', 'code': 14}])])
+        # fingerprint здесь не предмет проверки, но без него резидентский order/make
+        # отбивается ЛОКАЛЬНО и до разбора конверта дело не доходит.
+        api, _ = make_api([error_envelope([{'message': 'Incorrect goal', 'code': 14}])],
+                          fingerprint='test-fingerprint')
         with self.assertRaises(ApiError) as ctx:
             api.orderMake({'sectionCode': 'resident', 'tarifId': 'T1'})
         self.assertFalse(ctx.exception.isAccessError())
@@ -373,22 +383,30 @@ class SubPackageTest(unittest.TestCase):
 
 class ProlongMakeInsufficientFundsTest(unittest.TestCase):
     """
-    prolong/make при нехватке средств отдаёт status="error" с ПУСТЫМ errors[] и calc-данными
-    в data (ProlongMakeResponseClientDto.ofInsufficientFunds, ClientApiService.groovy:3185) —
-    ту же форму, что легитимный warning у prolong/calc. Раньше общий разбор конверта возвращал
-    это как успех, и несостоявшееся продление было неотличимо от состоявшегося.
+    prolong/make при нехватке средств кладёт причину в errors[{code: 16}]
+    (ProlongMakeResponseClientDto.ofInsufficientFunds), поэтому её разбирает общий код
+    конверта — отдельной обёртки в SDK больше нет.
+
+    Раньше форма была другой (status="error" + ПУСТОЙ errors[]), и под неё существовал
+    _assert_prolong_made. После смены формы его единственным оставшимся эффектом было
+    превращать ЛЕГИТИМНЫЙ success с пустым orderId в фальшивую ошибку — уже ПОСЛЕ списания.
     """
 
     def test_insufficient_funds_raises_instead_of_looking_like_success(self):
-        api, _ = make_api([envelope(
-            {'warning': 'Insufficient funds. Total 3.0000. Not enough $7.00',
-             'balance': 3, 'total': 10, 'quantity': 5, 'orders': 1},
-            status='error')])
+        api, _ = make_api([error_envelope(
+            [{'code': 16, 'message': 'Insufficient funds on balance'}])])
         with self.assertRaises(ApiError) as ctx:
             api.prolongMake('ipv4', ids=['68b1f0c4e13a4c0f1a2b3c4d'], periodId='1m')
-        self.assertIn('Not enough', str(ctx.exception))
-        # данные конверта остаются доступны для разбора
-        self.assertEqual(ctx.exception.body['balance'], 3)
+        self.assertEqual(ctx.exception.code, 16)
+        self.assertIn('Insufficient funds', str(ctx.exception))
+
+    def test_success_with_empty_order_id_is_not_turned_into_an_error(self):
+        """Деньги уже списаны — потерять total/balance здесь нельзя."""
+        api, _ = make_api([envelope(
+            {'orderId': '', 'total': 10, 'balance': 90, 'listBaseOrderNumbers': ['LH-1']})])
+        result = api.prolongMake('ipv4', ids=['68b1f0c4e13a4c0f1a2b3c4d'], periodId='1m')
+        self.assertEqual(result['total'], 10)
+        self.assertEqual(result['listBaseOrderNumbers'], ['LH-1'])
 
     def test_successful_prolong_still_returns_data(self):
         api, _ = make_api([envelope({

@@ -89,6 +89,10 @@ class Api:
         self.paymentId = None
         self.paymentCode = None
         self.generateAuth = 'N'
+        # X-Fingerprint можно задать и прямо в headers — тогда он уйдёт со всеми запросами;
+        # подхватываем это значение, чтобы локальный гейт order/make не ругался на уже
+        # настроенный заголовок.
+        self.fingerprint = config.get('fingerprint') or self.headers.get('X-Fingerprint')
 
     def close(self):
         """Close the underlying requests session."""
@@ -133,6 +137,25 @@ class Api:
 
     def getGenerateAuth(self):
         return self.generateAuth
+
+    def setFingerprint(self, fingerprint):
+        """
+        Значение заголовка X-Fingerprint для order/make.
+
+        Контракт (components.parameters.Fingerprint) требует СТАБИЛЬНЫЙ идентификатор
+        установки: форма не проверяется ("any opaque string is accepted"), но значение,
+        генерируемое заново на каждый процесс, ломает анти-фрод и affiliate-атрибуцию,
+        ради которых заголовок и введён. Поэтому SDK его не выдумывает — задайте свой
+        и сохраните между запусками.
+
+        Для резидентских и скраперных заказов заголовок ОБЯЗАТЕЛЕН: без него
+        OrderService отвечает "Header X-Fingerprint is required" и заказ не создаётся.
+        Остальные секции его игнорируют, слать его всегда безопасно.
+        """
+        self.fingerprint = fingerprint
+
+    def getFingerprint(self):
+        return self.fingerprint
 
     def request(self, method, uri, **options):
         """
@@ -403,8 +426,13 @@ class Api:
     # --------------------------- Balance auto top-up ---------------------------
 
     #: Поля запроса balance/autotopup/set (AutoTopupSetRequestClientDto).
-    AUTO_TOPUP_FIELDS = (
-        'enabled', 'threshold', 'amount', 'subscriptionId', 'dailyCountCap', 'monthlyAmountCap')
+    AUTO_TOPUP_FIELDS = ('enabled', 'threshold', 'amount', 'subscriptionId')
+
+    #: Убраны из контракта 2026-08-18 вместе с кодами ошибок 54 и 55: лимиты списаний больше
+    #: не настраиваются, действует один общий серверный (5 успешных пополнений в час).
+    #: Присланные сервер молча игнорирует, поэтому отбиваем их локально — иначе вызов проходит,
+    #: возвращает success и не делает НИЧЕГО.
+    AUTO_TOPUP_REMOVED_FIELDS = ('dailyCountCap', 'monthlyAmountCap')
 
     def balanceAutoTopupGet(self):
         """
@@ -421,8 +449,6 @@ class Api:
                     созданных до 2026-08-14),
                 paymentMethod (dict|None): {id, status ("active"/"expired"), paymentMethod
                     ("card"/"PayPal"/"Google Pay"/"Apple Pay"), brand, last4, exp ("MM/YYYY")},
-                dailyCountCap (int), monthlyAmountCap (float): действующие анти-абьюз лимиты
-                    (свои или серверные дефолты),
                 failCount (int): подряд идущие неудачные списания,
                 lastAttemptAt: дата последней попытки или None (java.util.Date, при
                     дефолтной сериализации Spring — строка ISO-8601),
@@ -436,11 +462,29 @@ class Api:
         """
         return self.request('GET', 'balance/autotopup/get')
 
-    def balanceAutoTopupSet(self, enabled=_UNSET, threshold=_UNSET, amount=_UNSET,
-                            subscriptionId=_UNSET, dailyCountCap=_UNSET,
-                            monthlyAmountCap=_UNSET):
+    @classmethod
+    def _assert_auto_topup_fields(cls, values):
         """
-        Enable/disable auto top-up or update its thresholds and caps.
+        dailyCountCap и monthlyAmountCap удалены из контракта 2026-08-18
+        (AutoTopupSetRequestClientDto): сервер их игнорирует, коды ошибок 54/55 сняты и не
+        переиспользуются. Раньше вызов с ними проходил локальный гейт, возвращал success и не
+        делал ничего — ровно тот тихий no-op, который белый список полей и должен предотвращать.
+
+        Raises:
+            ValueError: если в теле есть хотя бы одно из удалённых полей.
+        """
+        removed = [key for key in cls.AUTO_TOPUP_REMOVED_FIELDS if key in values]
+        if removed:
+            raise ValueError(
+                "{} removed from balance/autotopup/set on 2026-08-18: the server ignores the "
+                "field and a single shared limit applies instead (error codes 54/55 are gone "
+                "too). Drop it from the call.".format(' and '.join(removed)))
+        return values
+
+    def balanceAutoTopupSet(self, enabled=_UNSET, threshold=_UNSET, amount=_UNSET,
+                            subscriptionId=_UNSET, **unsupported):
+        """
+        Enable/disable auto top-up or update its thresholds.
 
         PARTIAL UPDATE: любое непереданное поле сервер не меняет, поэтому в тело уходят
         ТОЛЬКО реально переданные поля — чтобы поменять один порог, достаточно
@@ -457,29 +501,32 @@ class Api:
             amount (float): сумма одного автопополнения; минимум $5 и не меньше threshold.
             subscriptionId (str): подписка Paddle, которой списывать — ``paymentMethod.id``
                 из balanceAutoTopupGet(). Пока карта одна, можно не передавать.
-            dailyCountCap (int): свой (более строгий) лимит числа списаний в сутки.
-            monthlyAmountCap (float): свой лимит суммы списаний за 30 дней.
 
         Returns:
             dict: состояние ПОСЛЕ сохранения, в той же форме, что у balanceAutoTopupGet() —
                 второй запрос за актуальным state не нужен.
 
         Raises:
+            ValueError: если передан dailyCountCap или monthlyAmountCap — оба удалены из
+                контракта 2026-08-18, см. _assert_auto_topup_fields().
             ApiError: валидация целиком серверная и применяется к РЕЗУЛЬТАТУ мержа. Коды:
                 49 — фича недоступна, 50 — threshold ниже минимума,
                 51 — amount ниже минимума, 52 — amount не покрывает threshold,
-                53 — нет привязанного способа оплаты, 54 — dailyCountCap ниже минимума,
-                55 — monthlyAmountCap меньше одного пополнения, 56 — карта истекла.
-                Граничные значения приходят в ``error.custom_data``:
-                {"minAmount": ..., "minThreshold": ..., "minDailyCountCap": ...}.
+                53 — нет привязанного способа оплаты, 56 — карта истекла.
+                Коды 54 и 55 удалены вместе с полями лимитов. Граничные значения приходят
+                в ``error.custom_data``: {"minAmount": ..., "minThreshold": ...}.
         """
         if isinstance(enabled, dict):
-            data = self.filterNone(dict(enabled))
+            data = self.filterNone(self._assert_auto_topup_fields(dict(enabled)))
         else:
+            self._assert_auto_topup_fields(unsupported)
+            if unsupported:
+                raise TypeError(
+                    'balanceAutoTopupSet() got an unexpected keyword argument {!r}'.format(
+                        sorted(unsupported)[0]))
             values = {
                 'enabled': enabled, 'threshold': threshold, 'amount': amount,
-                'subscriptionId': subscriptionId, 'dailyCountCap': dailyCountCap,
-                'monthlyAmountCap': monthlyAmountCap}
+                'subscriptionId': subscriptionId}
             # _UNSET и None означают "поле не передано": null для сервера равен отсутствию
             # ключа, и отправлять его вместо сохранённого значения незачем. False и 0
             # сохраняются, поэтому filterNone здесь не годится.
@@ -508,14 +555,17 @@ class Api:
                 словарь разделов сразу.
 
                 Что реально приходит в ответе (не больше и не меньше):
-                    country[]: id, name, alpha3 → alpha3 и есть countryCode;
-                    period[]: id, name ("1 month") → КОДА периода здесь НЕТ;
-                    mobile country[].operators.{dedicated,shared}[]: id, name,
+                    country[]: id, name → id и ЕСТЬ alpha3-код страны, отдельного поля
+                        alpha3 сервер не отдаёт (ReferenceCountryClientDto знает только
+                        id и name);
+                    period[]: id, name ("1 month") → id и есть код периода;
+                    mobile country[].operators.{dedicated,shared}[]: id, name, traffic,
                         rotations[{id, name}] → отдельного operatorCode нет, передавайте
                         полученный id как есть (сервер резолвит и ObjectId, и tag);
-                    mix/mix_isp country[]: id, name, alpha3 (null), tag → tag и есть mixCode;
-                    mix/mix_isp quantities[]: id, name, quantities — без tag;
-                    resident tarifs[]: id, name, personal → КОДА тарифа здесь НЕТ.
+                    mix/mix_isp country[]: id, name → в id лежит тег mix-пакета, отдельных
+                        полей alpha3 и tag здесь нет;
+                    mix/mix_isp quantities[]: id, name, quantities;
+                    resident/scraper tarifs[]: id, name, personal → id и есть код тарифа.
         """
         if type is None:
             return self.request('GET', 'reference/list')
@@ -529,6 +579,41 @@ class Api:
             return {'paymentCode': self.getPaymentCode()}
         return {'paymentId': self.getPaymentId()}
 
+    #: Пары *Id/*Code для order/* и то, кто из них СТАРШЕ на сервере
+    #: (True = старше *Code). Список ровно из normalizeOrderReferenceCodes.
+    ORDER_REFERENCE_PAIRS = (
+        ('countryId', 'countryCode', True), ('periodId', 'periodCode', True),
+        ('paymentId', 'paymentCode', True), ('mixId', 'mixCode', False),
+        ('operatorId', 'operatorCode', False), ('rotationId', 'rotationCode', False),
+        ('tarifId', 'tarifCode', False))
+
+    #: normalizeProlongReferenceCodes знает только период и платёжку, и у обеих пар старше *Code.
+    PROLONG_REFERENCE_PAIRS = (
+        ('periodId', 'periodCode', True), ('paymentId', 'paymentCode', True))
+
+    @staticmethod
+    def _resolveReferencePairs(payload, pairs):
+        """
+        Убирает лишнюю половину пары *Id/*Code — ровно по серверному приоритету.
+
+        У payment/country/period старше *Code: ветка кода на сервере срабатывает всегда, когда
+        код задан. У operator/rotation/mix/tarif старше *Id: там условие
+        ``if (xCode && !trimToNull(xId))``, то есть код применяется, ТОЛЬКО когда парный id пуст.
+        Раньше SDK выбрасывал *Id при ЛЮБОМ заданном *Code, и клиент, заполнивший обе половины,
+        молча получал не тот пакет/оператора/ротацию/тариф, который выбрал бы сервер.
+
+        Пустая строка — это "не задано" (на сервере trimToNull), поэтому валидную парную
+        половину она не стирает.
+        """
+        def filled(key):
+            value = payload.get(key)
+            return value is not None and str(value).strip() != ''
+
+        for id_key, code_key, code_wins in pairs:
+            if filled(id_key) and filled(code_key):
+                payload.pop(id_key if code_wins else code_key, None)
+        return payload
+
     def mergeOrderOptions(self, payload, options=None):
         """
         Merge v2 identifiers/codes while avoiding conflicting id/code pairs.
@@ -541,26 +626,25 @@ class Api:
 
         rotationCode фолбэка не имеет вообще: он лишь проверяется на целое число и
         копируется в rotationId, так что пользуйтесь сразу rotationId (МИНУТЫ).
+
+        Если заполнены обе половины пары, лишняя убирается по СЕРВЕРНОМУ приоритету —
+        см. _resolveReferencePairs() и ORDER_REFERENCE_PAIRS.
         """
         values = options or {}
         if not isinstance(values, dict):
             raise TypeError('order options must be a dict')
+        # generateAuth и алиасы uptime раньше в список не входили и молча терялись: первый
+        # затирался значением setGenerateAuth() (по умолчанию 'N') в withGenerateAuth(), вторые
+        # исчезали вовсе, хотя @JsonAlias(["highAvailability", "isUptime"]) сервер их принимает.
         allowed = (
             'countryId', 'countryCode', 'periodId', 'periodCode', 'paymentId', 'paymentCode',
-            'mixId', 'mixCode', 'uptime', 'protocol', 'mobileServiceType', 'operatorId',
-            'operatorCode', 'rotationId', 'rotationCode', 'tarifId', 'tarifCode',
-            'authorization', 'coupon', 'customTargetName', 'quantity')
+            'mixId', 'mixCode', 'uptime', 'highAvailability', 'isUptime', 'protocol',
+            'mobileServiceType', 'operatorId', 'operatorCode', 'rotationId', 'rotationCode',
+            'tarifId', 'tarifCode', 'authorization', 'coupon', 'customTargetName', 'quantity',
+            'generateAuth')
         payload.update({key: values[key] for key in allowed if key in values})
-        for id_key, code_key in (
-                ('countryId', 'countryCode'), ('periodId', 'periodCode'),
-                ('paymentId', 'paymentCode'), ('mixId', 'mixCode'),
-                ('operatorId', 'operatorCode'), ('rotationId', 'rotationCode'),
-                ('tarifId', 'tarifCode')):
-            if code_key in values and values[code_key] is not None:
-                payload.pop(id_key, None)
-            elif id_key in values and values[id_key] is not None:
-                payload.pop(code_key, None)
-        return self.filterNone(payload)
+        return self.filterNone(
+            self._resolveReferencePairs(payload, self.ORDER_REFERENCE_PAIRS))
 
     @staticmethod
     def _order_options(options, extra):
@@ -634,8 +718,14 @@ class Api:
             'tarifId': tarifId, 'coupon': coupon}, options)
 
     def withGenerateAuth(self, data):
-        """generateAuth is accepted by order/make only, order/calc silently drops it."""
-        return {**data, 'generateAuth': self.getGenerateAuth()}
+        """
+        generateAuth is accepted by order/make only, order/calc silently drops it.
+
+        Значение из самого payload сильнее: setGenerateAuth() — это ДЕФОЛТ клиента, и раньше
+        он затирал явно переданный generateAuth (тот и так терялся в белом списке
+        mergeOrderOptions, так что до провода не доходил вовсе).
+        """
+        return {'generateAuth': self.getGenerateAuth(), **data}
 
     @staticmethod
     def _assert_target_name(data):
@@ -682,6 +772,36 @@ class Api:
             'customTargetName is required for {} orders '
             '(client api returns "Incorrect goal", code 14)'.format(section))
 
+    #: Секции, которым X-Fingerprint ОБЯЗАТЕЛЕН: OrderService.createResidentOrder /
+    #: createScraperOrder без него отвечают "Header X-Fingerprint is required" и заказ не
+    #: создаётся. Прочие секции заголовок игнорируют.
+    FINGERPRINT_REQUIRED_SECTIONS = ('resident', 'scraper')
+
+    @classmethod
+    def _assert_fingerprint(cls, data, fingerprint):
+        """
+        Повторяет серверную проверку заголовка X-Fingerprint для резидентских и скраперных
+        заказов: заказ без него не создаётся вовсе, так что платить за отказ сетевым запросом
+        незачем — так же, как с целью заказа и с paymentId.
+
+        sectionCode нормализуем как сервер (регистр и '-'/' ' -> '_').
+
+        Raises:
+            ValueError: если секция требует заголовок, а значение не задано.
+        """
+        section = (data or {}).get('sectionCode')
+        section = '' if section is None else str(section).strip().lower().replace('-', '_').replace(' ', '_')
+        if section not in cls.FINGERPRINT_REQUIRED_SECTIONS:
+            return
+        if fingerprint is not None and str(fingerprint).strip() != '':
+            return
+        raise ValueError(
+            'X-Fingerprint is required for {} orders (client api answers "Header X-Fingerprint '
+            'is required" and creates nothing). Set a STABLE per-installation value: '
+            "Api({{'key': ..., 'fingerprint': '...'}}), setFingerprint(...) or "
+            'orderMake(data, fingerprint=...). Do not generate it per process — the header '
+            'feeds anti-fraud and affiliate attribution.'.format(section))
+
     def orderCalc(self, data):
         """
         Calculate the order.
@@ -703,7 +823,7 @@ class Api:
         self._assert_target_name(data)
         return self.request('POST', 'order/calc', json=data)
 
-    def orderMake(self, data):
+    def orderMake(self, data, fingerprint=None):
         """
         Create an order.
 
@@ -712,12 +832,25 @@ class Api:
                 ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident | scraper.
                 Идентификаторы — ObjectId-СТРОКИ (в том числе orderId в ответе), и в каждом
                 *Id вместо ObjectId принимается код (см. orderCalc). rotationId — МИНУТЫ.
+            fingerprint (str): значение X-Fingerprint только для этого вызова; по умолчанию
+                берётся заданное конфигом или setFingerprint(). Заголовок объявлен
+                required на всей операции order/make, для resident и scraper он
+                действительно обязателен, остальные секции его игнорируют — поэтому
+                отправляем его для ЛЮБОЙ секции, как только значение известно.
+
+        Raises:
+            ValueError: если секция resident/scraper, а fingerprint не задан
+                (см. _assert_fingerprint).
 
         Returns:
             dict: The response from the endpoint.
         """
         self._assert_target_name(data)
-        return self.request('POST', 'order/make', json=data)
+        value = fingerprint if fingerprint is not None else self.getFingerprint()
+        value = '' if value is None else str(value).strip()
+        self._assert_fingerprint(data, value)
+        options = {'headers': {'X-Fingerprint': value}} if value else {}
+        return self.request('POST', 'order/make', json=data, **options)
 
     def orderCalcIpv4(self, countryId=None, periodId=None, quantity=None, authorization=None,
                       coupon=None, customTargetName=None, options=None, **order_options):
@@ -917,14 +1050,18 @@ class Api:
             countryId, periodId, quantity, authorization, coupon, operatorId, rotationId,
             mobileServiceType, self._order_options(options, order_options))))
 
-    def orderMakeResident(self, tarifId=None, coupon=None, options=None, **order_options):
+    def orderMakeResident(self, tarifId=None, coupon=None, options=None, fingerprint=None,
+                          **order_options):
         """
         Create an order Resident. Attention! Deducts money from the balance.
 
         tarifId — ObjectId резидентского тарифа ЛИБО его code.
+
+        Резидентский заказ БЕЗ X-Fingerprint сервер не создаёт вовсе, поэтому значение должно
+        быть задано конфигом/setFingerprint() либо передано сюда аргументом ``fingerprint``.
         """
         return self.orderMake(self.prepareResident(
-            tarifId, coupon, self._order_options(options, order_options)))
+            tarifId, coupon, self._order_options(options, order_options)), fingerprint)
 
     # --------------------------- Prolong ---------------------------
 
@@ -984,12 +1121,8 @@ class Api:
                 'periodId', 'periodCode', 'paymentId', 'paymentCode'):
             if key in values:
                 payload[key] = values[key]
-        for id_key, code_key in (('periodId', 'periodCode'), ('paymentId', 'paymentCode')):
-            if code_key in values and values[code_key] is not None:
-                payload.pop(id_key, None)
-            elif id_key in values and values[id_key] is not None:
-                payload.pop(code_key, None)
-        return self.filterNone(payload)
+        return self.filterNone(
+            self._resolveReferencePairs(payload, self.PROLONG_REFERENCE_PAIRS))
 
     def prolongCalc(self, type, ids=None, periodId=None, coupon='', options=None, **prolong_options):
         """
@@ -1033,36 +1166,218 @@ class Api:
             dict: {'orderId': ObjectId-строка, 'total', 'balance', 'listBaseOrderNumbers'}.
 
         Raises:
-            ApiError: при нехватке средств — продление НЕ состоялось.
+            ApiError: при нехватке средств — продление НЕ состоялось. Причина приходит в
+                errors[{code: 16, message: "Insufficient funds on balance"}]
+                (ProlongMakeResponseClientDto.ofInsufficientFunds), а calc-данные с дословным
+                warning остаются в конверте — ``error.body['data']``.
         """
         values = self._order_options(options, prolong_options)
-        return self._assert_prolong_made(
-            self.request('POST', 'prolong/make/' + type,
-                         json=self.prepareProlong(ids, periodId, coupon, values)))
+        # Прежняя обёртка _assert_prolong_made здесь УБРАНА. Она писалась под старую форму
+        # нехватки средств ("status: error" + ПУСТОЙ errors[]) и с тех пор, как причина уехала
+        # в errors[{code:16}], разбирается общим кодом конверта. Единственным оставшимся её
+        # эффектом было превращать ЛЕГИТИМНЫЙ "status: success" с пустым orderId в фальшивую
+        # ошибку — уже ПОСЛЕ списания денег, потеряв total/balance/listBaseOrderNumbers.
+        return self.request('POST', 'prolong/make/' + type,
+                            json=self.prepareProlong(ids, periodId, coupon, values))
 
-    @staticmethod
-    def _assert_prolong_made(data):
-        """
-        При нехватке средств prolong/make отдаёт конверт status="error" с ПУСТЫМ errors[] и
-        calc-данными в data (ProlongMakeResponseClientDto.ofInsufficientFunds,
-        ClientApiService.groovy:3185) — ровно ту же форму, что легитимный warning у
-        prolong/calc. Из-за этого общий разбор конверта возвращал данные как успех, и
-        несостоявшееся продление выглядело как состоявшееся. Успех — непустой orderId.
+    # --------------------------- Auto prolong ---------------------------
 
-        order/make этим не страдает: у OrderMakeResponseClientDto только ofSuccess/ofError,
-        и при ошибке errors[] всегда заполнен.
+    #: Поля тела autoprolong/* — унаследованный ProlongRequest плюс subscriptionId и tarifId.
+    #: Snake-написания сервер тоже принимает (AutoProlongRequestClientDto.applyAliases), но
+    #: приоритет там у camelCase, поэтому SDK шлёт каноническую форму; присланные вызывающим
+    #: алиасы просто пропускаем дальше, мешать им незачем.
+    AUTO_PROLONG_FIELDS = (
+        'ids', 'ips', 'orderSeparatorIds', 'orderSeparatorId', 'periodId', 'periodCode',
+        'paymentId', 'paymentCode', 'subscriptionId', 'tarifId',
+        'payment_id', 'subscription_id', 'tarif_id', 'tariffId')
+
+    #: Тип, которого у автопродления нет: скрапер добирает трафик новым заказом через
+    #: order/make, и сервер отвечает "Create new order to add traffic, prolong options not
+    #: available".
+    AUTO_PROLONG_UNSUPPORTED_TYPES = ('scraper',)
+
+    #: Платёжки, которые автопродление принимает. Разовый чекаут Paddle требует редиректа в
+    #: браузер, которого у headless-клиента нет, поэтому он сюда не входит.
+    AUTO_PROLONG_PAYMENT_CODES = ('balance', 'paddle_subscription')
+
+    def prepareAutoProlong(self, ids=None, periodId=None, options=None):
         """
-        if not isinstance(data, dict):
-            return data
-        order_id = data.get('orderId')
-        if order_id is not None and str(order_id).strip() != '':
-            return data
-        warning = data.get('warning')
-        warning = str(warning).strip() if warning is not None else ''
-        raise ApiError(
-            warning or 'prolong/make did not create an order (insufficient funds)',
-            http_status=200,
-            body=data)
+        Собрать тело autoprolong/*: тот же выбор прокси, что у prolong/* (ids/ips/
+        orderSeparatorIds, periodId/periodCode, paymentId/paymentCode), плюс subscriptionId
+        и tarifId.
+
+        Купон СОЗНАТЕЛЬНО не отправляется, хотя поле унаследовано от ProlongRequest:
+        автопродление промокод не применяет нигде, и превью со скидкой врало бы ровно про ту
+        сумму, ради которой ручку и зовут.
+        """
+        if isinstance(ids, dict):
+            payload = self.paymentOptions()
+            values = {**ids, **(options or {})}
+        else:
+            routed = {}
+            targetIps, targetIds = self._splitProlongTargets(ids)
+            if targetIps or targetIds:
+                # Пустой ids рядом с ips не ставим: сервер отдаёт приоритет ids.
+                if targetIds:
+                    routed['ids'] = targetIds
+                if targetIps:
+                    routed['ips'] = targetIps
+            elif ids is not None:
+                routed['ids'] = ids
+            payload = {**self.paymentOptions(), **routed, 'periodId': periodId}
+            values = options or {}
+        if not isinstance(values, dict):
+            raise TypeError('autoprolong options must be a dict')
+        for key in self.AUTO_PROLONG_FIELDS:
+            if key in values:
+                payload[key] = values[key]
+        return self.filterNone(
+            self._resolveReferencePairs(payload, self.PROLONG_REFERENCE_PAIRS))
+
+    @classmethod
+    def _assert_auto_prolong_type(cls, type):
+        """
+        Скрапер автопродления не имеет: сервер отбивает его ДО резолва типа, тем же текстом,
+        что и ручное продление. Проверяем локально, чтобы не платить сетевым запросом.
+
+        Raises:
+            ValueError: для type=scraper.
+        """
+        normalized = '' if type is None else str(type).strip().lower().replace('-', '_').replace(' ', '_')
+        if normalized in cls.AUTO_PROLONG_UNSUPPORTED_TYPES:
+            raise ValueError(
+                'autoprolong is not available for {}: client api answers "Create new order to '
+                'add traffic, prolong options not available". Buy traffic with '
+                'orderMake({{"sectionCode": "scraper", ...}}).'.format(normalized))
+
+    @classmethod
+    def _assert_auto_prolong_payment(cls, payload):
+        """
+        paymentId у autoprolong/calc и /enable ОБЯЗАТЕЛЕН — в отличие от prolong/*, где он
+        необязателен: списание произойдёт без клиента, и "по умолчанию с баланса" было бы
+        догадкой за него. Без поля сервер отвечает "Set [paymentId]".
+
+        Какой ТИП платёжки стоит за ObjectId, знает только сервер, поэтому здесь проверяется
+        наличие значения; а если код прислан дословно, то ещё и то, что он из разрешённой пары
+        и что у paddle_subscription есть парный subscriptionId ("Set [subscriptionId]").
+
+        Raises:
+            ValueError: если платёжка не задана, задана неподдерживаемым кодом или подписка
+                Paddle выбрана без subscriptionId.
+        """
+        payment = payload.get('paymentId') or payload.get('paymentCode') or payload.get('payment_id')
+        payment = '' if payment is None else str(payment).strip()
+        if not payment:
+            raise ValueError(
+                'paymentId is required for autoprolong/calc and autoprolong/enable (client api '
+                'answers "Set [paymentId]"): the charge happens while you are away, so the '
+                'payment system cannot be guessed. Accepted: {}.'.format(
+                    ' / '.join(cls.AUTO_PROLONG_PAYMENT_CODES)))
+        if payment.lower() not in cls.AUTO_PROLONG_PAYMENT_CODES:
+            # Значение похоже на ObjectId или на код другой платёжки — тип резолвит сервер,
+            # локально отбиваем только заведомо чужой код.
+            if payment.lower() in ('paddle', 'cryptomus', 'paypal'):
+                raise ValueError(
+                    'autoprolong accepts only {} ({!r} is a one-off checkout and needs a '
+                    'browser redirect).'.format(
+                        ' / '.join(cls.AUTO_PROLONG_PAYMENT_CODES), payment))
+            return
+        if payment.lower() == 'paddle_subscription':
+            subscription = (payload.get('subscriptionId') or payload.get('subscription_id') or '')
+            if str(subscription).strip() == '':
+                raise ValueError(
+                    'subscriptionId is required when paying autoprolong with '
+                    'paddle_subscription (client api answers "Set [subscriptionId]")')
+
+    def autoProlongCalc(self, type, ids=None, periodId=None, options=None, **autoprolong_options):
+        """
+        Calculate the upcoming automatic extension charge. Ничего не меняет.
+
+        Args:
+            type (str): ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident. Для scraper
+                автопродления нет (см. _assert_auto_prolong_type).
+            ids (list): сами адреса из proxy/list ЛИБО ObjectId-строки — как в prolongCalc().
+                Для type=resident выбор не нужен: единица правки — весь пакет.
+            periodId (str): ObjectId периода ЛИБО код периода ('1m'). Обязателен для обычных
+                прокси ("Set existed [periodId] from reference"), у резидентки периода нет.
+            options: paymentId (ОБЯЗАТЕЛЕН, balance либо paddle_subscription),
+                subscriptionId (при paddle_subscription), tarifId (только resident —
+                подтверждение тарифа самого пакета, сменить тариф автопродление не умеет),
+                orderSeparatorId / orderSeparatorIds, ips, ids.
+
+        Returns:
+            dict: warning, balance, total, quantity, currency, discount, orders, items[],
+                days (null у резидентки), tarifId (только резидентка), chargeDate
+                (null у резидентки — пакет продлевается по дате ОКОНЧАНИЯ ЛИБО по исчерпанию
+                трафика), dateEnd, paymentId, autoProlong. Даты — строки "yyyy-MM-dd HH:mm:ss".
+
+                НЕХВАТКА БАЛАНСА — это НЕ исключение: конверт приходит со status="error", но с
+                ЗАПОЛНЕННЫМ data и ПУСТЫМ errors[] (ofWarning, та же форма, что у
+                prolong/calc), поэтому метод возвращает данные, а warning объясняет разницу.
+
+        Raises:
+            ValueError: для type=scraper и при незаданной/неподдерживаемой платёжке.
+        """
+        self._assert_auto_prolong_type(type)
+        values = self._order_options(options, autoprolong_options)
+        payload = self.prepareAutoProlong(ids, periodId, values)
+        self._assert_auto_prolong_payment(payload)
+        return self.request('POST', 'autoprolong/calc/' + type, json=payload)
+
+    def autoProlongEnable(self, type, ids=None, periodId=None, options=None, **autoprolong_options):
+        """
+        Enable automatic extension. Сейчас ничего не списывается — деньги нужны к chargeDate.
+
+        Заменяет удалённый с сервера resident/autorenew/enable: то же самое теперь
+        autoProlongEnable('resident', paymentId=...).
+
+        Args:
+            type (str): как в autoProlongCalc(). Для resident тело пакетное — достаточно
+                paymentId (и опционально tarifId), ids/ips/periodId там не нужны.
+            ids (list): адреса из proxy/list ЛИБО ObjectId-строки.
+            periodId (str): период, который будет покупаться при каждом продлении.
+            options: paymentId (ОБЯЗАТЕЛЕН), subscriptionId, tarifId, orderSeparatorIds, …
+
+        Returns:
+            dict: warning, autoProlong, quantity, ids[], days, paymentId, chargeDate, dateEnd.
+                quantity и ids — это то, что РЕАЛЬНО затронуто, а не эхо запроса: у ipv6
+                автопродление включается целым заказом, поэтому один адрес включает все;
+                у резидентки quantity=1 и пустой ids.
+
+        Raises:
+            ValueError: для type=scraper и при незаданной/неподдерживаемой платёжке.
+        """
+        self._assert_auto_prolong_type(type)
+        values = self._order_options(options, autoprolong_options)
+        payload = self.prepareAutoProlong(ids, periodId, values)
+        self._assert_auto_prolong_payment(payload)
+        return self.request('POST', 'autoprolong/enable/' + type, json=payload)
+
+    def autoProlongDisable(self, type, ids=None, options=None, **autoprolong_options):
+        """
+        Disable automatic extension. Сбрасывает и привязанный период, и платёжку, так что
+        следующий autoProlongEnable() должен прислать их снова.
+
+        Заменяет удалённый с сервера resident/autorenew/disable.
+
+        Args:
+            type (str): как в autoProlongCalc(). Для resident тело не нужно вовсе — пакет
+                адресуется по apiKey.
+            ids (list): адреса из proxy/list ЛИБО ObjectId-строки.
+            options: orderSeparatorId / orderSeparatorIds, ips, ids. Ни periodId, ни paymentId
+                здесь не требуются.
+
+        Returns:
+            dict: warning, autoProlong, quantity, ids[], dateEnd, а days / paymentId /
+                chargeDate — null: выключение их и очищает.
+
+        Raises:
+            ValueError: для type=scraper.
+        """
+        self._assert_auto_prolong_type(type)
+        values = self._order_options(options, autoprolong_options)
+        return self.request('POST', 'autoprolong/disable/' + type,
+                            json=self.prepareAutoProlong(ids, None, values))
 
     # --------------------------- Proxy ---------------------------
 
@@ -1207,11 +1522,15 @@ class Api:
         """
         Package Information. Remaining traffic, end date.
 
+        Ключи ответа — snake_case, а НЕ camelCase (схема ResidentPackage в openapi.yaml).
+        Единственное имя, совпадающее в обоих написаниях, — ``rotation``.
+
         Returns:
-            dict: packageKey, isActive, tarifId, isLinkDate, trafficLimit, trafficUsage,
-                trafficLeft, trafficLimitSub, trafficUsageSub, trafficLeftSub, autoRenew,
-                rotation и ``expiredAt`` — СТРОКА в формате "dd.MM.yyyy HH:mm:ss".
-                (Не путать с субпакетным expired_at: там объект PHP-даты.)
+            dict: package_key, user_id, is_active, tarif_id, is_link_date, traffic_limit,
+                traffic_usage, traffic_left, их близнецы ``*_sub`` и ``*_formatted``,
+                auto_renew, auto_renew_payment_id, rotation и ``expired_at`` — СТРОКА
+                в формате "dd.MM.yyyy HH:mm:ss". Именно здесь эта ручка отличается от
+                ``residentsubuser/*``, где тот же ключ приходит объектом PHP-даты.
         """
         return self.request('GET', 'resident/package')
 
@@ -1238,7 +1557,11 @@ class Api:
                 "key is required"). Дополнительно: login, date_start, date_end.
 
         Returns:
-            dict: Traffic details.
+            dict | list: обычно объект, СГРУППИРОВАННЫЙ по логину листа и времени. Но при
+                пустом периоде сервер отдаёт ПУСТОЙ СПИСОК ``[]``, а не ``{}`` — байт-в-байт
+                как v1, где пустой ассоциативный массив PHP сериализуется в ``[]``. Код,
+                идущий по ключам или ``.items()``, на этом штатном ответе упадёт: проверяйте
+                результат перед разбором.
         """
         return self.request('POST', 'resident/traffic/details', json=filter or {})
 
@@ -1311,7 +1634,9 @@ class Api:
                 значит "без гео-фильтра". Раньше geo=[] падал AttributeError.
 
         Returns:
-            dict: Created list model. Гео в ответе — объект, ``id`` — число.
+            dict: Created list model, ``id`` — число. В ОТВЕТЕ ``geo`` — МАССИВ
+                (``geo[0].country``), пустой при листе без гео-фильтра; объектом GeoDto
+                оно бывает только в ЗАПРОСЕ. ``geo['country']`` даст TypeError.
         """
         if isinstance(title, dict):
             data = dict(title)
