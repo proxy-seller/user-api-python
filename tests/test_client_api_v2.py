@@ -551,5 +551,37 @@ class OrderMixIdentifierTest(unittest.TestCase):
         self.assertNotIn('countryId', session.last['json'])
 
 
+class OrderListTest(unittest.TestCase):
+    """
+    Имена фильтров order/list — snake_case из v1 (OrderController.orderList), а не
+    camelCase proxy/list: ту же ручку через обратное зеркало зовут клиенты легаси-API, и
+    переименование сломало бы их молча — запрос ушёл бы, фильтр не применился.
+    """
+
+    def test_v1_filter_names_are_sent_as_given(self):
+        api, session = make_api([envelope({'metadata': {}, 'items': []})])
+        api.orderList(order_id='ORDER_OBJECT_ID', start_date='01.06.2023',
+                      end_date='30.06.2023', status='PAYED', is_extend='Y',
+                      auto_order='N', page=1, limit=20, sort_by='date_insert',
+                      order='desc')
+        self.assertEqual(session.last['method'], 'GET')
+        self.assertTrue(session.last['url'].endswith('order/list'))
+        self.assertEqual(session.last['params'], {
+            'order_id': 'ORDER_OBJECT_ID', 'start_date': '01.06.2023',
+            'end_date': '30.06.2023', 'status': 'PAYED', 'is_extend': 'Y',
+            'auto_order': 'N', 'page': 1, 'limit': 20, 'sort_by': 'date_insert',
+            'order': 'desc'})
+
+    def test_no_filters_means_no_params(self):
+        api, session = make_api([envelope({'metadata': {}, 'items': []})])
+        api.orderList()
+        self.assertEqual(session.last['params'], {})
+
+    def test_none_filters_are_dropped(self):
+        api, session = make_api([envelope({'metadata': {}, 'items': []})])
+        api.orderList(order_id=None, status='NOT_PAYED')
+        self.assertEqual(session.last['params'], {'status': 'NOT_PAYED'})
+
+
 if __name__ == '__main__':
     unittest.main()

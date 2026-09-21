@@ -202,6 +202,26 @@ positionally.
 `mix`/`mix_isp` it is only needed when the server cannot tell which package you mean, so naming
 the package — `orderCalcMix('europe-2-mix_IPv4', '1m', 10)` — removes the need for it.
 
+### Listing orders
+
+```python
+api.orderList(status='PAYED', sort_by='date_insert', order='desc', page=1, limit=20)
+api.orderList()  # the same call with no filters at all
+```
+
+Every filter is optional and every name is the snake_case one of v1: `order_id`, `start_date`,
+`end_date`, `status` (`PAYED` | `NOT_PAYED` | `RETURN` — the `status_type` of the response),
+`is_extend`, `auto_order`, `page`, `limit`, `sort_by` (`date_insert` | `summ` | `status`) and
+`order` (`asc` | `desc`). The same endpoint answers legacy-API clients through the reverse
+mirror, so the spelling is theirs.
+
+The result is not a flat list but a `metadata` + `items` pair, and `metadata` is always there:
+without `limit` it reports `total_pages: 1`, `current_limit: 0` and the whole list in `items`.
+`summ` and `items[]['price']` are **strings with the currency already in them** (`'$25.00'`),
+`auto_order` and `is_extend` are `'Y'`/`'N'` rather than booleans, and the dates are ISO 8601 with offset (`2026-09-01T14:15:26+00:00`)
+strings. `id` is the legacy bitrix number as a string; the ObjectId is `order_id` — the same value
+`proxyList()` returns as `order_id`.
+
 ## Renewing proxies
 
 Renew by the addresses themselves — the same strings `proxyList()` gives you. No ids to look up:
@@ -430,6 +450,9 @@ api.residentSubUserListDelete('PACKAGE_KEY', 561)  # {'status': 'delete'} | {'st
 
 Changes made after the 2.0 release, in the order the server shipped them:
 
+- **`order/list` is new** — `orderList()`, see [Listing orders](#listing-orders). Its filters keep
+  the v1 snake_case names because legacy-API clients reach the same endpoint through the reverse
+  mirror, and its `data` is a `metadata` + `items` pair rather than a flat list.
 - **`resident/autorenew/{enable,disable,calculate}` were removed** and replaced by
   `autoprolong/{calc,enable,disable}/{type}` — see [Automatic renewal](#automatic-renewal).
   `type='resident'` is the residential branch of the same three endpoints.

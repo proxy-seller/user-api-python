@@ -1063,6 +1063,36 @@ class Api:
         return self.orderMake(self.prepareResident(
             tarifId, coupon, self._order_options(options, order_options)), fingerprint)
 
+    def orderList(self, **filters):
+        """
+        List of orders.
+
+        Args:
+            filters: order_id (ObjectId-СТРОКА заказа), start_date / end_date (границы по
+                дате создания; принимается и ISO, и 'dd.MM.yyyy'), status (PAYED | NOT_PAYED | RETURN — это
+                status_type ответа, а не человекочитаемый status), is_extend ('Y'/'N' —
+                только продления либо только первичные покупки), auto_order ('Y'/'N' — по
+                включённому автопродлению), page, limit, sort_by (date_insert | summ |
+                status), order (asc | desc). Все опциональны, имена snake_case, как в v1:
+                ту же ручку через обратное зеркало зовут клиенты легаси-API. Сервер их не
+                валидирует — неизвестное значение просто не применяется как фильтр.
+
+        Returns:
+            dict: не плоский список, а пара ``metadata`` + ``items`` — форма v1.
+                ``metadata`` (total_orders, total_pages, current_page, current_limit) есть
+                всегда: без ``limit`` там total_pages = 1, current_limit = 0, а весь список
+                лежит в ``items``.
+
+                id, order_id, order_number, base_order_number и items[]['order_part_id'] —
+                СТРОКИ. id — легаси-число битрикса либо суррогат от base_order_number, наш
+                ObjectId лежит в order_id (тот же, что order_id в proxyList()). summ и
+                вложенные items[]['price'] — тоже строки, уже с валютой ('$25.00'),
+                auto_order / is_extend — 'Y'/'N', даты — ISO 8601 со смещением ('2026-09-01T14:15:26+00:00'), date_payed пуст, пока
+                заказ не оплачен.
+        """
+        params = self.filterNone(filters)
+        return self.request('GET', 'order/list', params=params)
+
     # --------------------------- Prolong ---------------------------
 
     @staticmethod
