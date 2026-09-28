@@ -548,10 +548,10 @@ class DocumentedOrderExamplesTest(unittest.TestCase):
 
 class ProlongSelectionTest(unittest.TestCase):
     """
-    "Что продлить" зависит от типа в пути: ipv4 / isp / mobile — отдельные прокси (ipIds — id
+    "Что продлить" зависит от типа в пути: ipv4 / isp / mobile — отдельные прокси (ids — id
     из proxy/list, ips — адреса), ipv6 / mix / mix_isp — только целые заказы (orderIds —
-    order_id). Позиционный аргумент по-прежнему называется ids, но раскладывается по типу:
-    поля ids на проводе нет.
+    order_id). Второй аргумент (параметр ids) раскладывается по типу: у ipv4 / isp / mobile
+    id прокси уходят в поле ids, у ipv6 / mix / mix_isp — в orderIds.
     """
 
     PROXY_ID = '68b1f0c4e13a4c0f1a2b3c4d'
@@ -563,13 +563,13 @@ class ProlongSelectionTest(unittest.TestCase):
         self.assertEqual(session.last['json'], {
             'ips': ['1.2.3.4', '5.6.7.8'], 'periodId': '1m', 'coupon': ''})
 
-    def test_proxy_ids_go_into_ip_ids_for_per_proxy_types(self):
+    def test_proxy_ids_go_into_ids_for_per_proxy_types(self):
         for proxy_type in ('ipv4', 'isp', 'mobile', 'IPv4', ' ISP '):
             with self.subTest(type=proxy_type):
                 api, session = make_api([envelope({'total': 1})])
                 api.prolongCalc(proxy_type, [self.PROXY_ID], '1m')
                 self.assertEqual(session.last['json'], {
-                    'ipIds': [self.PROXY_ID], 'periodId': '1m', 'coupon': ''})
+                    'ids': [self.PROXY_ID], 'periodId': '1m', 'coupon': ''})
 
     def test_order_ids_go_into_order_ids_for_whole_order_types(self):
         for proxy_type in ('ipv6', 'mix', 'mix_isp', 'IPv6', 'MIX-ISP', 'mix isp'):
@@ -579,12 +579,26 @@ class ProlongSelectionTest(unittest.TestCase):
                 self.assertEqual(session.last['json'], {
                     'orderIds': [self.ORDER_ID], 'periodId': '1m', 'coupon': ''})
 
-    def test_keyword_ids_still_works(self):
-        """Имя параметра ids сохранено: именованный вызов прежних версий не ломается."""
-        api, session = make_api([envelope({'total': 1})])
+    def test_keyword_ids_is_routed_by_type(self):
+        """
+        ids= — это второй аргумент, а не проводное поле: он раскладывается по типу так же,
+        как позиционный (у ipv4 / isp / mobile id прокси уходит в ids, у ipv6 / mix /
+        mix_isp — в orderIds).
+        """
+        api, session = make_api([envelope({'total': 1}), envelope({'total': 1}),
+                                 envelope({'orderId': self.ORDER_ID}),
+                                 envelope({'autoProlong': False})])
+        api.prolongCalc('ipv4', ids=[self.PROXY_ID], periodId='1m')
+        self.assertEqual(session.last['json'], {
+            'ids': [self.PROXY_ID], 'periodId': '1m', 'coupon': ''})
         api.prolongCalc('ipv6', ids=[self.ORDER_ID], periodId='1m')
         self.assertEqual(session.last['json']['orderIds'], [self.ORDER_ID])
         self.assertNotIn('ids', session.last['json'])
+        api.prolongMake('mix', ids=[self.ORDER_ID], periodId='1m')
+        self.assertEqual(session.last['json'], {
+            'orderIds': [self.ORDER_ID], 'periodId': '1m', 'coupon': ''})
+        api.autoProlongDisable('ipv6', ids=[self.ORDER_ID])
+        self.assertEqual(session.last['json'], {'orderIds': [self.ORDER_ID]})
 
     def test_mobile_address_with_colons_is_an_address(self):
         """mobile: 'ip:port_http:port_socks' — двоеточия не мешают попасть в ips."""
@@ -606,17 +620,43 @@ class ProlongSelectionTest(unittest.TestCase):
         self.assertEqual(session.last['json'], {
             'ips': ['1.2.3.4:26000'], 'periodId': '1m', 'coupon': ''})
 
+    def test_wrong_kind_of_explicit_field_is_left_for_the_server_to_reject(self):
+        """
+        Поля выбора в проводном виде уходят как есть: ids у ipv6 не переосмысляется в
+        orderIds, orderIds у ipv4 — в ids. Сервер отвечает ошибкой с code 0, называющей
+        нужное поле.
+        """
+        cases = (
+            ('ipv6', {'ids': [self.ORDER_ID]},
+             '[ids] is not applicable for ipv6: prolong by [orderIds]'),
+            ('ipv4', {'orderIds': [self.ORDER_ID]},
+             '[orderIds] is not applicable for ipv4: prolong by [ids]'),
+        )
+        for proxy_type, selection, message in cases:
+            with self.subTest(type=proxy_type):
+                api, session = make_api([error_envelope([{'message': message, 'code': 0}])])
+                with self.assertRaises(ApiError) as ctx:
+                    api.prolongCalc(proxy_type, None, '1m', options=selection)
+                self.assertEqual(ctx.exception.code, 0)
+                self.assertEqual(str(ctx.exception), message)
+                self.assertEqual(session.last['json'], {
+                    **selection, 'periodId': '1m', 'coupon': ''})
+
     def test_proxy_ids_and_addresses_are_not_combined(self):
         """
-        При ipIds сервер ips не читает: смешанный список продлил бы только id, а адреса выпали
-        бы молча, поэтому смесь отбивается до запроса — и позиционная, и явная.
+        Если пришли и ids, и ips, сервер продлевает по ids и игнорирует ips: смешанный список
+        продлил бы только id, а адреса выпали бы молча, поэтому смесь отбивается до запроса —
+        и позиционная, и явная.
         """
         api, session = make_api()
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as ctx:
             api.prolongCalc('ipv4', ['1.2.3.4', self.PROXY_ID], '1m')
+        self.assertIn('renews by ids and ignores ips', str(ctx.exception))
         with self.assertRaises(ValueError):
-            api.prolongMake('mobile', ipIds=[self.PROXY_ID], ips=['10.0.0.1:8000:9000'],
-                            periodId='1m')
+            api.prolongMake('mobile', [self.PROXY_ID], '1m', ips=['10.0.0.1:8000:9000'])
+        with self.assertRaises(ValueError):
+            api.prolongMake('isp', None, '1m',
+                            options={'ids': [self.PROXY_ID], 'ips': ['1.2.3.4']})
         self.assertEqual(session.calls, [])
 
     def test_mixed_list_for_whole_order_type_is_left_for_the_server(self):
@@ -635,12 +675,12 @@ class ProlongSelectionTest(unittest.TestCase):
         cases = (
             ([], {}),
             ('  , ', {}),
-            (None, {'ipIds': [], 'ips': (), 'orderIds': ''}),
+            (None, {'ips': (), 'orderIds': '', 'options': {'ids': []}}),
         )
-        for ids, options in cases:
-            with self.subTest(ids=ids, options=options):
+        for ids, kwargs in cases:
+            with self.subTest(ids=ids, kwargs=kwargs):
                 api, session = make_api([envelope({'total': 1})])
-                api.prolongCalc('ipv4', ids, '1m', **options)
+                api.prolongCalc('ipv4', ids, '1m', **kwargs)
                 self.assertEqual(session.last['json'], {'periodId': '1m', 'coupon': ''})
 
     def test_explicit_selection_field_is_sent_as_a_list(self):
@@ -652,19 +692,20 @@ class ProlongSelectionTest(unittest.TestCase):
         """prepareProlong — публичный помощник: без type раскладывает как ipv4 / isp / mobile."""
         api, _ = make_api()
         self.assertEqual(api.prepareProlong([self.PROXY_ID], '1m'), {
-            'ipIds': [self.PROXY_ID], 'periodId': '1m', 'coupon': ''})
+            'ids': [self.PROXY_ID], 'periodId': '1m', 'coupon': ''})
         self.assertEqual(api.prepareProlong([self.ORDER_ID], '1m', type='mix_isp'), {
             'orderIds': [self.ORDER_ID], 'periodId': '1m', 'coupon': ''})
 
 
 class ProlongRemovedFieldsTest(unittest.TestCase):
     """
-    ids, orderSeparatorIds и orderSeparatorId удалены из контракта prolong/* и autoprolong/*.
+    orderSeparatorIds и orderSeparatorId удалены из контракта prolong/* и autoprolong/*.
     Сервер их больше не читает, поэтому SDK не выбрасывает их молча, а отбивает до запроса
-    с названием замены — из dict-формы, из options и из именованных аргументов. Позиционный
-    параметр ids остаётся и раскладывается по типу.
+    с названием замены (orderIds) — из dict-формы, из options и из именованных аргументов.
+    ids к удалённым не относится: это рабочее поле выбора ipv4 / isp / mobile.
     """
 
+    PROXY_ID = '68b1f0c4e13a4c0f1a2b3c4d'
     ORDER_ID = '6a248de4717805635cf6057d'
 
     def assertRejectedBeforeRequest(self, call, *needles):
@@ -675,22 +716,33 @@ class ProlongRemovedFieldsTest(unittest.TestCase):
             self.assertIn(needle, str(ctx.exception))
         self.assertEqual(session.calls, [])
 
-    def test_ids_key_names_ip_ids_and_order_ids(self):
-        calls = (
-            lambda api: api.prolongCalc('ipv4', None, '1m', options={'ids': ['ID']}),
-            lambda api: api.prolongMake('ipv6', {'ids': [self.ORDER_ID], 'periodId': '1m'}),
-            lambda api: api.autoProlongCalc('mobile', None, '1m', paymentId='balance',
-                                            options={'ids': ['ID']}),
-            lambda api: api.autoProlongEnable('mix', {'ids': [self.ORDER_ID], 'periodId': '1m',
-                                                      'paymentId': 'balance'}),
-            lambda api: api.autoProlongDisable('isp', options={'ids': ['ID']}),
-            lambda api: api.prepareProlong(None, '1m', '', {'ids': ['ID']}),
+    def test_ids_key_is_sent_not_rejected(self):
+        """ids в options, в dict-форме и в теле prepareProlong() уходит на провод как есть."""
+        cases = (
+            (lambda api: api.prolongCalc('ipv4', None, '1m', options={'ids': [self.PROXY_ID]}),
+             'prolong/calc/ipv4', {'ids': [self.PROXY_ID], 'periodId': '1m', 'coupon': ''}),
+            (lambda api: api.prolongMake('isp', {'ids': [self.PROXY_ID], 'periodId': '1m'}),
+             'prolong/make/isp', {'ids': [self.PROXY_ID], 'periodId': '1m'}),
+            (lambda api: api.autoProlongCalc('mobile', None, '1m', paymentId='balance',
+                                             options={'ids': [self.PROXY_ID]}),
+             'autoprolong/calc/mobile',
+             {'ids': [self.PROXY_ID], 'periodId': '1m', 'paymentId': 'balance'}),
+            (lambda api: api.autoProlongEnable('ipv4', {'ids': [self.PROXY_ID], 'periodId': '1m',
+                                                        'paymentId': 'balance'}),
+             'autoprolong/enable/ipv4',
+             {'ids': [self.PROXY_ID], 'periodId': '1m', 'paymentId': 'balance'}),
+            (lambda api: api.autoProlongDisable('isp', options={'ids': [self.PROXY_ID]}),
+             'autoprolong/disable/isp', {'ids': [self.PROXY_ID]}),
         )
-        for index, call in enumerate(calls):
+        for index, (call, path, body) in enumerate(cases):
             with self.subTest(call=index):
-                self.assertRejectedBeforeRequest(
-                    call, 'ids was removed', 'ipIds (ipv4/isp/mobile)',
-                    'orderIds (ipv6/mix/mix_isp)')
+                api, session = make_api([envelope({'total': 1})])
+                call(api)
+                self.assertTrue(session.last['url'].endswith(path))
+                self.assertEqual(session.last['json'], body)
+        api, _ = make_api()
+        self.assertEqual(api.prepareProlong(None, '1m', '', {'ids': [self.PROXY_ID]}), {
+            'ids': [self.PROXY_ID], 'periodId': '1m', 'coupon': ''})
 
     def test_order_separator_keys_name_order_ids(self):
         calls = (
@@ -710,22 +762,11 @@ class ProlongRemovedFieldsTest(unittest.TestCase):
     def test_every_removed_key_is_named(self):
         api, session = make_api()
         with self.assertRaises(ValueError) as ctx:
-            api.prolongMake('mix', [self.ORDER_ID], '1m', options={'ids': ['ID']},
+            api.prolongMake('mix', [self.ORDER_ID], '1m',
                             orderSeparatorIds=['SEPARATOR_ID'], orderSeparatorId='SEPARATOR_ID')
-        message = str(ctx.exception)
-        self.assertIn('ids was removed', message)
-        self.assertIn('orderSeparatorIds/orderSeparatorId were removed: use orderIds', message)
+        self.assertIn('orderSeparatorIds/orderSeparatorId were removed: use orderIds',
+                      str(ctx.exception))
         self.assertEqual(session.calls, [])
-
-    def test_positional_ids_parameter_is_not_affected(self):
-        """Имя параметра осталось: ids= по-прежнему значит "что продлить" и раскладывается."""
-        api, session = make_api([envelope({'orderId': self.ORDER_ID}),
-                                 envelope({'autoProlong': False})])
-        api.prolongMake('mix', ids=[self.ORDER_ID], periodId='1m')
-        self.assertEqual(session.last['json'], {
-            'orderIds': [self.ORDER_ID], 'periodId': '1m', 'coupon': ''})
-        api.autoProlongDisable('ipv6', ids=[self.ORDER_ID])
-        self.assertEqual(session.last['json'], {'orderIds': [self.ORDER_ID]})
 
 
 class AutoProlongSelectionTest(unittest.TestCase):
@@ -737,11 +778,11 @@ class AutoProlongSelectionTest(unittest.TestCase):
     PROXY_ID = '68b1f0c4e13a4c0f1a2b3c4d'
     ORDER_ID = '6a248de4717805635cf6057d'
 
-    def test_per_proxy_types_use_ip_ids_and_ips(self):
+    def test_per_proxy_types_use_ids_and_ips(self):
         api, session = make_api([envelope({'autoProlong': True}), envelope({'total': 1})])
         api.autoProlongEnable('ipv4', [self.PROXY_ID], '1m', paymentId='balance')
         self.assertEqual(session.last['json'], {
-            'ipIds': [self.PROXY_ID], 'periodId': '1m', 'paymentId': 'balance'})
+            'ids': [self.PROXY_ID], 'periodId': '1m', 'paymentId': 'balance'})
         api.autoProlongCalc('mobile', ['10.0.0.1:8000:9000'], '1m', paymentId='balance')
         self.assertEqual(session.last['json'], {
             'ips': ['10.0.0.1:8000:9000'], 'periodId': '1m', 'paymentId': 'balance'})
@@ -780,33 +821,52 @@ class AutoProlongSelectionTest(unittest.TestCase):
         api.autoProlongDisable('resident')
         self.assertEqual(session.last['json'], {})
         # Пустой выбор — не выбор: обобщённый клиент может слать его для любого типа.
-        api.autoProlongCalc('Resident', [], paymentId='balance', ipIds=[], orderIds='')
+        api.autoProlongCalc('Resident', [], paymentId='balance', ips=(), orderIds='',
+                            options={'ids': []})
         self.assertEqual(session.last['json'], {'paymentId': 'balance'})
 
     def test_resident_with_selection_is_rejected_locally(self):
         """
-        Сервер отбивает выбор у resident ("[ipIds] is not applicable for resident: ..."), а
-        молча выбросить его нельзя: disable с адресом снял бы автопродление со всего пакета.
+        Любой выбор у resident — ids, ips или orderIds — сервер отбивает одним текстом
+        ("[ids] is not applicable for resident: ..."), а молча выбросить его нельзя: disable
+        с адресом снял бы автопродление со всего пакета.
         """
-        api, session = make_api()
-        with self.assertRaises(ValueError) as ctx:
-            api.autoProlongDisable('resident', ['1.2.3.4'])
-        self.assertIn('whole package', str(ctx.exception))
-        with self.assertRaises(ValueError):
-            api.autoProlongEnable('resident', [self.PROXY_ID], paymentId='balance')
-        with self.assertRaises(ValueError):
-            api.autoProlongCalc('resident', paymentId='balance', orderIds=[self.ORDER_ID])
-        self.assertEqual(session.calls, [])
+        server_text = ('[ids] is not applicable for resident: auto-prolong applies to the '
+                       'whole package')
+        calls = (
+            lambda api: api.autoProlongDisable('resident', ['1.2.3.4']),
+            lambda api: api.autoProlongEnable('resident', [self.PROXY_ID], paymentId='balance'),
+            lambda api: api.autoProlongCalc('resident', paymentId='balance',
+                                            orderIds=[self.ORDER_ID]),
+            lambda api: api.autoProlongCalc('resident', paymentId='balance',
+                                            options={'ids': [self.PROXY_ID]}),
+        )
+        for index, call in enumerate(calls):
+            with self.subTest(call=index):
+                api, session = make_api()
+                with self.assertRaises(ValueError) as ctx:
+                    call(api)
+                self.assertIn(server_text, str(ctx.exception))
+                self.assertEqual(session.calls, [])
 
-    def test_enable_answer_carries_ip_ids_and_order_ids(self):
-        """В ответе enable/disable поле ids переименовано в ipIds, рядом — orderIds."""
-        data = {'autoProlong': True, 'quantity': 100, 'ipIds': [self.PROXY_ID],
+    def test_enable_and_disable_answers_carry_ids_and_order_ids(self):
+        """
+        В ответе enable/disable — ids (затронутые прокси) и orderIds (их заказы); у resident
+        оба списка пусты.
+        """
+        data = {'autoProlong': True, 'quantity': 100, 'ids': [self.PROXY_ID],
                 'orderIds': [self.ORDER_ID], 'days': 30, 'paymentId': 'balance',
                 'chargeDate': '2026-09-14 12:00:00', 'dateEnd': '2026-09-15 12:00:00'}
-        api, _ = make_api([envelope(data)])
+        resident = {'autoProlong': False, 'quantity': 1, 'ids': [], 'orderIds': [],
+                    'days': 30, 'paymentId': None, 'chargeDate': None,
+                    'dateEnd': '2026-10-15 12:00:00'}
+        api, _ = make_api([envelope(data), envelope(resident)])
         result = api.autoProlongEnable('ipv6', [self.ORDER_ID], '1m', paymentId='balance')
-        self.assertEqual(result['ipIds'], [self.PROXY_ID])
+        self.assertEqual(result['ids'], [self.PROXY_ID])
         self.assertEqual(result['orderIds'], [self.ORDER_ID])
+        result = api.autoProlongDisable('resident')
+        self.assertEqual(result['ids'], [])
+        self.assertEqual(result['orderIds'], [])
 
 
 class OrderMixIdentifierTest(unittest.TestCase):

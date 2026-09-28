@@ -1454,24 +1454,24 @@ class Api:
     #: Типы, которые продаются и продлеваются только ЦЕЛЫМ заказом. Их выбор — orderIds
     #: (order_id из proxy/list или order/list): продлевается всё активное этого типа в
     #: указанных заказах, у mix/mix_isp — mix-пакеты этих заказов. Остальные типы
-    #: (ipv4 / isp / mobile) продлеваются по отдельным прокси — ipIds (id из proxy/list)
+    #: (ipv4 / isp / mobile) продлеваются по отдельным прокси — ids (id из proxy/list)
     #: либо ips (адреса).
     PROLONG_ORDER_TYPES = ('ipv6', 'mix', 'mix_isp')
 
     #: Поля выбора "что продлить" у prolong/* и autoprolong/*. Пустой список не
     #: отправляется: для сервера он ничем не отличается от отсутствующего поля.
-    PROLONG_SELECTION_FIELDS = ('ipIds', 'ips', 'orderIds')
+    PROLONG_SELECTION_FIELDS = ('ids', 'ips', 'orderIds')
 
     #: Поля тела prolong/calc и prolong/make.
     PROLONG_FIELDS = (
-        'ipIds', 'ips', 'orderIds', 'coupon', 'periodId', 'periodCode', 'paymentId',
+        'ids', 'ips', 'orderIds', 'coupon', 'periodId', 'periodCode', 'paymentId',
         'paymentCode')
 
     #: Поля выбора, удалённые из контракта prolong/* и autoprolong/*. Сервер их больше не
     #: читает, и запрос ушёл бы без выбора, поэтому переданные в dict-форме, в options или
     #: именованными аргументами они отбиваются локально — с подсказкой, чем их заменить
-    #: (см. _assert_no_removed_prolong_fields). Позиционный параметр ids к ним не относится.
-    PROLONG_REMOVED_FIELDS = ('ids', 'orderSeparatorIds', 'orderSeparatorId')
+    #: (см. _assert_no_removed_prolong_fields).
+    PROLONG_REMOVED_FIELDS = ('orderSeparatorIds', 'orderSeparatorId')
 
     @classmethod
     def _assert_no_removed_prolong_fields(cls, values):
@@ -1480,24 +1480,15 @@ class Api:
         их, решил бы, что продлевает выбранное, а сервер получил бы тело без выбора.
 
         Raises:
-            ValueError: если в values есть ids, orderSeparatorIds или orderSeparatorId —
-                с названием замены.
+            ValueError: если в values есть orderSeparatorIds или orderSeparatorId — с
+                названием замены (orderIds).
         """
         present = [key for key in cls.PROLONG_REMOVED_FIELDS if key in values]
-        if not present:
-            return
-        problems = []
-        if 'ids' in present:
-            problems.append(
-                'ids was removed: use ipIds (ipv4/isp/mobile) or orderIds (ipv6/mix/mix_isp), '
-                'or pass the selection as the second argument - the SDK routes it by type')
-        separators = [key for key in present if key != 'ids']
-        if separators:
-            problems.append(
+        if present:
+            raise ValueError(
                 '{} {} removed: use orderIds (order_id from proxy/list or order/list) - '
                 'mix/mix_isp are renewed as whole orders'.format(
-                    '/'.join(separators), 'were' if len(separators) > 1 else 'was'))
-        raise ValueError('; '.join(problems))
+                    '/'.join(present), 'were' if len(present) > 1 else 'was'))
 
     @staticmethod
     def _prolongItems(value):
@@ -1531,7 +1522,7 @@ class Api:
         Значение с точкой или двоеточием — адрес, он уходит в ips: у ipv4/isp это поле ip из
         proxy/list, у mobile — 'ip:port_http:port_socks'. Всё остальное — идентификатор: для
         ipv6 / mix / mix_isp это order_id заказа (orderIds — эти типы продлеваются только
-        целым заказом), для остальных типов — id прокси (ipIds). Список, кортеж, множество
+        целым заказом), для остальных типов — id прокси (ids). Список, кортеж, множество
         или строка через запятую; пустые элементы пропускаются.
 
         Адрес для ipv6 / mix / mix_isp тоже уходит в ips, а не переосмысляется: сервер
@@ -1539,7 +1530,7 @@ class Api:
         [orderIds]".
 
         Returns:
-            dict: только непустые поля выбора — ips и/или ipIds либо orderIds.
+            dict: только непустые поля выбора — ips и/или ids либо orderIds.
         """
         ips, ids = [], []
         for item in cls._prolongItems(targets):
@@ -1550,7 +1541,7 @@ class Api:
         selection = {}
         if ids:
             by_order = cls._normalize_type(type) in cls.PROLONG_ORDER_TYPES
-            selection['orderIds' if by_order else 'ipIds'] = ids
+            selection['orderIds' if by_order else 'ids'] = ids
         if ips:
             selection['ips'] = ips
         return selection
@@ -1566,8 +1557,9 @@ class Api:
             TypeError: если values не dict.
             ValueError: если в values есть удалённые из контракта поля выбора
                 (_assert_no_removed_prolong_fields); для типов из package_types — если выбор
-                вообще передан; для ipv4 / isp / mobile — если в теле оказались сразу ipIds и
-                ips: при ipIds сервер ips не читает, и адреса выпали бы из продления молча.
+                вообще передан; для ipv4 / isp / mobile — если в теле оказались сразу ids и
+                ips: сервер продлевает по ids и игнорирует ips, и адреса выпали бы из
+                продления молча.
         """
         if not isinstance(values, dict):
             raise TypeError('{} options must be a dict'.format(what))
@@ -1586,17 +1578,19 @@ class Api:
         if normalized in package_types:
             selected = [key for key in self.PROLONG_SELECTION_FIELDS if key in payload]
             if selected:
+                # Сервер отвечает одним и тем же текстом про [ids], какое бы из полей выбора
+                # ни пришло, — цитируем его дословно, а присланные поля называем отдельно.
                 raise ValueError(
                     '{} for {} applies to the whole package and takes no proxy selection, '
-                    'drop {} (client api answers "[{}] is not applicable for {}: auto-prolong '
+                    'drop {} (client api answers "[ids] is not applicable for {}: auto-prolong '
                     'applies to the whole package")'.format(
-                        what, normalized, ' / '.join(selected), selected[0], normalized))
-        elif ('ipIds' in payload and 'ips' in payload
+                        what, normalized, ' / '.join(selected), normalized))
+        elif ('ids' in payload and 'ips' in payload
                 and normalized not in self.PROLONG_ORDER_TYPES):
             raise ValueError(
-                'proxy ids and addresses cannot be combined{}: when ipIds is sent the server '
-                'ignores ips, so the addresses would be skipped silently. Pass either the ids '
-                'from proxy/list or the addresses.'.format(
+                'proxy ids and addresses cannot be combined{}: when both ids and ips are sent '
+                'the server renews by ids and ignores ips, so the addresses would be skipped '
+                'silently. Pass either the ids from proxy/list or the addresses.'.format(
                     ' for ' + normalized if normalized else ''))
         return self.filterNone(
             self._resolveReferencePairs(payload, self.PROLONG_REFERENCE_PAIRS))
@@ -1608,12 +1602,12 @@ class Api:
         Args:
             ids: что продлить, см. prolongCalc(); раскладывается по полям выбора с учётом
                 type. dict вместо значения — тело целиком, поля выбора в нём уже проводные
-                (ipIds / ips / orderIds); удалённые ids / orderSeparatorIds /
+                (ids / ips / orderIds) и уходят как есть; удалённые orderSeparatorIds /
                 orderSeparatorId в нём, как и в options, — ValueError.
             periodId (str): ObjectId периода ЛИБО код периода ('1m').
             coupon (str): Coupon code.
             options (dict): остальные поля тела (PROLONG_FIELDS); переданные явно, они сильнее.
-            type (str): тип прокси из пути. Без него идентификаторы уходят в ipIds, как у
+            type (str): тип прокси из пути. Без него идентификаторы уходят в ids, как у
                 ipv4 / isp / mobile.
         """
         if isinstance(ids, dict):
@@ -1630,36 +1624,39 @@ class Api:
         Args:
             type (str): The type of the order - ipv4, ipv6, mobile, isp, mix or mix_isp
                 (регистр и '-'/' ' не важны: 'MIX-ISP' == 'mix_isp').
-            ids (list): ЧТО продлить. Имя параметра сохранено ради совместимости позиционных
-                и именованных вызовов, но полем ``ids`` в тело оно не уходит — значения
-                раскладываются по типу (_splitProlongTargets):
+            ids (list): ЧТО продлить; значения раскладываются по типу
+                (_splitProlongTargets):
                     ipv4 / isp — адрес '1.2.3.4' (поле 'ip' из proxy/list) либо 'id' прокси;
                     mobile — адрес 'ip:port_http:port_socks' (из полей ip, port_http и
                         port_socks proxy/list) либо 'id' прокси;
                     ipv6 / mix / mix_isp — 'order_id' заказа из proxy/list или order/list:
                         эти типы продлеваются только ЦЕЛЫМ заказом — всё активное этого
                         типа в заказе (у mix/mix_isp — mix-пакеты заказа).
-                Адреса уходят в ips, id прокси — в ipIds, id заказов — в orderIds. Список
+                Адреса уходят в ips, id прокси — в ids, id заказов — в orderIds. Список
                 либо строка через запятую. Адреса и id прокси в одном вызове не смешиваются:
-                при ipIds сервер ips не читает, поэтому такая смесь отбивается локально.
+                если пришли и ids, и ips, сервер продлевает по ids и игнорирует ips, поэтому
+                такая смесь отбивается локально. Именованный ids= — этот же параметр, он
+                тоже раскладывается по типу.
             periodId (str): ObjectId периода ЛИБО код периода ('1m') — сервер резолвит код
                 прямо в этом поле, periodCode передавать не обязательно.
             coupon (str): Coupon code.
             options: paymentId (ObjectId ЛИБО код платёжной системы, например 'balance'),
-                paymentCode, periodCode, а также поля выбора в проводном виде — ipIds, ips,
-                orderIds (явное значение сильнее разложенного из ids). Пустые списки не
-                отправляются. Удалённые из контракта ids, orderSeparatorIds и
-                orderSeparatorId здесь (как и в dict-форме) — ValueError с подсказкой
-                замены; позиционного параметра ids это не касается.
+                paymentCode, periodCode, а также поля выбора в проводном виде — ids, ips,
+                orderIds: они уходят как есть, без раскладки, и явное значение сильнее
+                разложенного из параметра ids (поле ids дословно — только через options или
+                dict-форму). Пустые списки не отправляются. Удалённые из контракта
+                orderSeparatorIds и orderSeparatorId здесь (как и в dict-форме) — ValueError
+                с подсказкой замены (orderIds).
 
         Raises:
-            ValueError: если для ipv4 / isp / mobile вместе переданы id прокси и адреса, или
-                если в options / dict-форме есть ids, orderSeparatorIds либо
-                orderSeparatorId (замена — ipIds / orderIds).
-            ApiError: поле выбора не того вида для типа — "[orderIds] is not applicable for
-                ipv4: prolong by [ipIds]", "[ips] is not applicable for ipv6: prolong by
-                [orderIds]"; code 29 "Incorrect orderIds" — заказ чужой, без активных прокси
-                этого типа, или список пуст: запрос отбивается целиком.
+            ValueError: если для ipv4 / isp / mobile вместе переданы id прокси и адреса (ids
+                и ips), или если в options / dict-форме есть orderSeparatorIds либо
+                orderSeparatorId (замена — orderIds).
+            ApiError: поле выбора не того вида для типа, code 0 — "[ids] is not applicable
+                for ipv6: prolong by [orderIds]", "[ips] is not applicable for ipv6: prolong
+                by [orderIds]", "[orderIds] is not applicable for ipv4: prolong by [ids]";
+                code 29 "Incorrect orderIds" — заказ чужой, без активных прокси этого типа,
+                или список пуст: запрос отбивается целиком.
 
         Returns:
             dict: warning, balance, total, quantity, currency, discount, orders, items[].
@@ -1677,11 +1674,10 @@ class Api:
         Args:
             type (str): The type of the order - ipv4, ipv6, mobile, isp, mix or mix_isp.
             ids (list): что продлить — адреса либо id прокси для ipv4 / isp / mobile,
-                order_id заказов для ipv6 / mix / mix_isp; см. prolongCalc(). Имя параметра
-                сохранено ради совместимости.
+                order_id заказов для ipv6 / mix / mix_isp; см. prolongCalc().
             periodId (str): ObjectId периода ЛИБО код периода ('1m'), см. prolongCalc().
             coupon (str): Coupon code.
-            options: paymentId (ObjectId ЛИБО код платёжной системы), ipIds / ips / orderIds —
+            options: paymentId (ObjectId ЛИБО код платёжной системы), ids / ips / orderIds —
                 как в prolongCalc().
 
         Returns:
@@ -1713,10 +1709,10 @@ class Api:
     #: Поля тела autoprolong/* — поля выбора и оплаты prolong/* (без купона) плюс
     #: subscriptionId и tarifId. Snake-написания сервер тоже принимает, но приоритет у
     #: camelCase, поэтому SDK шлёт каноническую форму; присланные вызывающим алиасы просто
-    #: пропускаем дальше, мешать им незачем. Удалённые из контракта ids, orderSeparatorIds и
+    #: пропускаем дальше, мешать им незачем. Удалённые из контракта orderSeparatorIds и
     #: orderSeparatorId отбиваются ValueError, как и у prolong/* (PROLONG_REMOVED_FIELDS).
     AUTO_PROLONG_FIELDS = (
-        'ipIds', 'ips', 'orderIds', 'periodId', 'periodCode',
+        'ids', 'ips', 'orderIds', 'periodId', 'periodCode',
         'paymentId', 'paymentCode', 'subscriptionId', 'tarifId',
         'payment_id', 'subscription_id', 'tarif_id', 'tariffId')
 
@@ -1726,8 +1722,8 @@ class Api:
     AUTO_PROLONG_UNSUPPORTED_TYPES = ('scraper',)
 
     #: Типы, у которых автопродление адресуется всем пакетом: полей выбора в теле нет, а
-    #: присланные сервер отбивает ("[ipIds] is not applicable for resident: auto-prolong
-    #: applies to the whole package").
+    #: любое присланное — ids, ips или orderIds — сервер отбивает ("[ids] is not applicable
+    #: for resident: auto-prolong applies to the whole package").
     AUTO_PROLONG_PACKAGE_TYPES = ('resident',)
 
     #: Платёжки, которые автопродление принимает. Разовый чекаут Paddle требует редиректа в
@@ -1751,8 +1747,8 @@ class Api:
             ValueError: для type=resident с непустым выбором — сервер такой запрос отбивает, а
                 молча выбросить выбор нельзя: клиент решил бы, что правит отдельные адреса,
                 хотя правится весь пакет. Для ipv4 / isp / mobile — если вместе переданы id
-                прокси и адреса. Для любого типа — если в options / dict-форме есть удалённые
-                ids, orderSeparatorIds или orderSeparatorId (см. _prolongPayload).
+                прокси и адреса (ids и ips). Для любого типа — если в options / dict-форме
+                есть удалённые orderSeparatorIds или orderSeparatorId (см. _prolongPayload).
         """
         if isinstance(ids, dict):
             return self._prolongPayload(
@@ -1825,16 +1821,16 @@ class Api:
             type (str): ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident. Для scraper
                 автопродления нет (см. _assert_auto_prolong_type).
             ids (list): что поставить на автопродление — как в prolongCalc(): адрес либо id
-                прокси для ipv4 / isp / mobile, order_id заказа для ipv6 / mix / mix_isp
-                (такие заказы автопродлеваются целиком). Имя параметра сохранено ради
-                совместимости. Для type=resident выбор не передаётся: единица правки — весь
-                пакет (переданный выбор — ValueError).
+                прокси для ipv4 / isp / mobile (уходят в ips / ids), order_id заказа для
+                ipv6 / mix / mix_isp (уходят в orderIds, такие заказы автопродлеваются
+                целиком). Для type=resident выбор не передаётся: единица правки — весь пакет
+                (переданный выбор — ValueError).
             periodId (str): ObjectId периода ЛИБО код периода ('1m'). Обязателен для обычных
                 прокси ("Set existed [periodId] from reference"), у резидентки периода нет.
             options: paymentId (ОБЯЗАТЕЛЕН, balance либо paddle_subscription),
                 subscriptionId (при paddle_subscription), tarifId (только resident —
                 подтверждение тарифа самого пакета, сменить тариф автопродление не умеет),
-                поля выбора в проводном виде — ipIds, ips, orderIds.
+                поля выбора в проводном виде — ids, ips, orderIds.
 
         Returns:
             dict: warning, balance, total, quantity, currency, discount, orders, items[],
@@ -1848,8 +1844,8 @@ class Api:
 
         Raises:
             ValueError: для type=scraper, при незаданной/неподдерживаемой платёжке, при
-                выборе для resident, при смеси id прокси и адресов и при удалённых ids /
-                orderSeparatorIds / orderSeparatorId в options (замена — ipIds / orderIds).
+                выборе для resident, при смеси id прокси и адресов (ids и ips) и при
+                удалённых orderSeparatorIds / orderSeparatorId в options (замена — orderIds).
         """
         self._assert_auto_prolong_type(type)
         values = self._order_options(options, autoprolong_options)
@@ -1870,15 +1866,14 @@ class Api:
             ids (list): что включить — как в autoProlongCalc(): адреса либо id прокси, для
                 ipv6 / mix / mix_isp — order_id заказов.
             periodId (str): период, который будет покупаться при каждом продлении.
-            options: paymentId (ОБЯЗАТЕЛЕН), subscriptionId, tarifId, ipIds / ips / orderIds, …
+            options: paymentId (ОБЯЗАТЕЛЕН), subscriptionId, tarifId, ids / ips / orderIds, …
 
         Returns:
-            dict: warning, autoProlong, quantity, ipIds[], orderIds[], days, paymentId,
-                chargeDate, dateEnd. quantity, ipIds (id затронутых прокси) и orderIds (их
+            dict: warning, autoProlong, quantity, ids[], orderIds[], days, paymentId,
+                chargeDate, dateEnd. quantity, ids (id затронутых прокси) и orderIds (их
                 заказы) — то, что РЕАЛЬНО затронуто, а не эхо запроса: у ipv6 / mix / mix_isp
                 автопродление включается на все активные прокси присланных заказов. У
-                резидентки quantity=1, а ipIds и orderIds пусты. Прежнее поле ответа ids
-                переименовано в ipIds.
+                резидентки quantity=1, а ids и orderIds пусты.
 
         Raises:
             ValueError: как в autoProlongCalc().
@@ -1901,16 +1896,19 @@ class Api:
                 адресуется по apiKey.
             ids (list): что выключить — как в autoProlongCalc(): адреса либо id прокси, для
                 ipv6 / mix / mix_isp — order_id заказов.
-            options: ipIds / ips / orderIds. Ни periodId, ни paymentId здесь не требуются.
+            options: ids / ips / orderIds. Ни periodId, ни paymentId здесь не требуются.
 
         Returns:
-            dict: warning, autoProlong, quantity, ipIds[], orderIds[], dateEnd, а paymentId и
-                chargeDate — null: выключение их и очищает. days у обычных прокси тоже null,
-                у резидентки — период тарифа (тариф на пакете остаётся).
+            dict: warning, autoProlong, quantity, ids[], orderIds[], dateEnd, а paymentId и
+                chargeDate — null: выключение их и очищает. ids (id затронутых прокси) и
+                orderIds (их заказы) — то, что РЕАЛЬНО выключено, как у autoProlongEnable();
+                у резидентки оба пусты. days у обычных прокси тоже null, у резидентки —
+                период тарифа (тариф на пакете остаётся).
 
         Raises:
             ValueError: для type=scraper, при выборе для resident, при смеси id прокси и
-                адресов и при удалённых ids / orderSeparatorIds / orderSeparatorId в options.
+                адресов (ids и ips) и при удалённых orderSeparatorIds / orderSeparatorId в
+                options.
         """
         self._assert_auto_prolong_type(type)
         values = self._order_options(options, autoprolong_options)

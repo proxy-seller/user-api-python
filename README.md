@@ -312,8 +312,8 @@ What you renew by depends on the proxy type, and every value comes straight out 
 
 | type | pass this | from a `proxyList()` item | sent as |
 |---|---|---|---|
-| `ipv4`, `isp` | the address `1.2.3.4`, or the proxy id | `item['ip']`, or `item['id']` | `ips` / `ipIds` |
-| `mobile` | the address `ip:port_http:port_socks`, or the proxy id | `item['ip']`, `item['port_http']`, `item['port_socks']`, or `item['id']` | `ips` / `ipIds` |
+| `ipv4`, `isp` | the address `1.2.3.4`, or the proxy id | `item['ip']`, or `item['id']` | `ips` / `ids` |
+| `mobile` | the address `ip:port_http:port_socks`, or the proxy id | `item['ip']`, `item['port_http']`, `item['port_socks']`, or `item['id']` | `ips` / `ids` |
 | `ipv6`, `mix`, `mix_isp` | the order id | `item['order_id']` (also `order_id` in `orderList()`) | `orderIds` |
 
 ```python
@@ -352,19 +352,23 @@ result['orderIds']                           # every renewed order
 ```
 
 If any of the orders is not yours or has no active proxy of that type, the whole request fails
-with code 29 `Incorrect orderIds` and nothing is renewed. Addresses are not accepted for these
-types — `ipv6` is no longer renewed by its `host:port` — and the server rejects a selection
-field of the wrong kind with an error naming it, e.g.
-`[ips] is not applicable for ipv6: prolong by [orderIds]`.
+with code 29 `Incorrect orderIds` and nothing is renewed. Neither proxy ids nor addresses are
+accepted for these types — `ipv6` is no longer renewed by its `host:port`.
+
+A selection field of the wrong kind for the type is rejected with code 0 and an error that
+names the field to use instead, e.g.:
+
+* `[ids] is not applicable for ipv6: prolong by [orderIds]` — the same for `[ips]`;
+* `[orderIds] is not applicable for ipv4: prolong by [ids]`.
 
 How the second argument is routed: a value with a dot or a colon is an address and goes to
-`ips`; anything else is an id — `ipIds` for `ipv4`/`isp`/`mobile`, `orderIds` for
+`ips`; anything else is an id — `ids` for `ipv4`/`isp`/`mobile`, `orderIds` for
 `ipv6`/`mix`/`mix_isp`. A list and a comma-separated string both work; empty values are
 skipped, and an empty selection is not sent at all. Do not mix proxy ids and addresses in one
-call: when `ipIds` is present the server ignores `ips`, so the SDK raises `ValueError` rather
-than letting the addresses drop out silently. The argument is still named `ids`, so existing
-positional and keyword calls keep working; it only means "what to renew" and never reaches the
-wire under that name.
+call: when both `ids` and `ips` arrive, the server renews by `ids` and ignores `ips`, so the
+SDK raises `ValueError` rather than letting the addresses drop out silently. The second
+argument is named `ids`, and `ids=` as a keyword is routed the same way — for
+`ipv6`/`mix`/`mix_isp` its values go out as `orderIds`.
 
 The period takes a code (`'1m'`), same fallback as `order/*`, and the fourth argument is a coupon.
 
@@ -384,15 +388,14 @@ api.prolongMake(
     periodId='1m', paymentId='balance', coupon='SALE10')
 ```
 
-Accepted: `ipIds`, `ips`, `orderIds`, `periodId`/`periodCode`, `paymentId`/`paymentCode` and
-`coupon`; an explicit value wins over the one routed from the second argument. Types: `ipv4`,
-`ipv6`, `mobile`, `isp`, `mix`, `mix_isp`.
+Accepted: `ips`, `orderIds`, `periodId`/`periodCode`, `paymentId`/`paymentCode` and `coupon`;
+an explicit value wins over the one routed from the second argument. `ids=` is the second
+argument itself and is routed by type as described above; in `options` or in the payload dict
+`ids` goes out as given. Types: `ipv4`, `ipv6`, `mobile`, `isp`, `mix`, `mix_isp`.
 
-`ids`, `orderSeparatorIds` and `orderSeparatorId` were removed from the API. Passed as keywords,
-in `options` or in the payload dict, they raise `ValueError` naming the replacement instead of
-being dropped: `ids` → `ipIds` (`ipv4`/`isp`/`mobile`) or `orderIds` (`ipv6`/`mix`/`mix_isp`),
-`orderSeparatorIds`/`orderSeparatorId` → `orderIds`. This is only about those keys — the second
-positional argument is still named `ids` and works as described above.
+`orderSeparatorIds` and `orderSeparatorId` were removed from the API. Passed as keywords, in
+`options` or in the payload dict, they raise `ValueError` naming the replacement, `orderIds`,
+instead of being dropped.
 
 </details>
 
@@ -409,8 +412,9 @@ api.autoProlongDisable('ipv4', ['1.2.3.4'])
 api.autoProlongEnable('mix', ['ORDER_ID'], '1m', paymentId='balance')   # whole orders
 ```
 
-The selection works exactly as in [Renewing proxies](#renewing-proxies): addresses or proxy ids
-for `ipv4`, `isp` and `mobile`, the `order_id` for `ipv6`, `mix` and `mix_isp`.
+The selection works exactly as in [Renewing proxies](#renewing-proxies): addresses (`ips`) or
+proxy ids (`ids`) for `ipv4`, `isp` and `mobile`, the `order_id` (`orderIds`) for `ipv6`, `mix`
+and `mix_isp`.
 
 `paymentId` is **mandatory** for `calc` and `enable` — the charge happens while you are away, so
 the payment system cannot be guessed. Only `balance` and `paddle_subscription` are accepted: a
@@ -425,16 +429,17 @@ api.autoProlongEnable('resident', paymentId='balance', tarifId='trial')
 api.autoProlongDisable('resident')
 ```
 
-A selection passed with `resident` raises `ValueError` locally (the server rejects it with
-`[ipIds] is not applicable for resident: auto-prolong applies to the whole package`): dropping it
+A selection passed with `resident` — `ids`, `ips` or `orderIds` — raises `ValueError` locally
+(the server rejects any of them with
+`[ids] is not applicable for resident: auto-prolong applies to the whole package`): dropping it
 silently would switch the whole package while you meant single addresses.
 
 Three things about the answers before you parse them:
 
-* **`ipIds` is not an echo.** `enable` and `disable` report what was actually switched:
-  `quantity`, `ipIds` (the proxies) and `orderIds` (their orders). For `ipv6`, `mix` and
+* **`ids` is not an echo.** `enable` and `disable` report what was actually switched:
+  `quantity`, `ids` (the proxies) and `orderIds` (their orders). For `ipv6`, `mix` and
   `mix_isp` that is every active proxy of the orders you sent; for `resident` `quantity` is 1
-  and both lists are empty. The proxy list used to be called `ids`.
+  and both lists are empty.
 * **Not enough money is not an exception.** `calc` answers `status: "error"` with a *filled*
   `data` and an empty `errors[]` — the same shape `prolong/calc` uses. Read `data['warning']`.
 * **Residential fills different fields.** `chargeDate` is `None` there (a package renews on
@@ -599,20 +604,22 @@ Changes made after the 2.0 release, in the order the server shipped them:
   `errors[{code: 16}]` and raise like any other business error; a legitimate success with an
   empty `orderId` is returned intact instead of being turned into a false failure after the
   money has already been taken.
-- **Renewal selection is per type now, and its fields were renamed (breaking).** `prolong/*` and
-  `autoprolong/*` no longer read `ids`, `orderSeparatorIds` or `orderSeparatorId`. `ipv4`, `isp`
-  and `mobile` are renewed per proxy by `ipIds` (the proxy `id`) or `ips` (addresses); `ipv6`,
-  `mix` and `mix_isp` only as whole orders by `orderIds` (the `order_id`), so `ipv6` is no longer
-  renewed by its `host:port`, and a MIX order is renewed with all of its packages rather than by
-  separator ids. A selection field of the wrong kind is rejected by name
-  (`[ipIds] is not applicable for ipv6: prolong by [orderIds]`), and an unknown or foreign order
-  fails the whole request with code 29 `Incorrect orderIds`. The SDK routes the second argument
-  of `prolongCalc()`, `prolongMake()` and `autoProlong*()` by type — the parameter keeps its name
-  `ids` — and drops empty lists. It raises `ValueError` when the removed fields are passed as
-  keywords, in `options` or in the payload dict (naming `ipIds`/`orderIds` as the replacement),
-  on a mix of proxy ids and addresses, and on any selection for `resident` auto-renewal. Responses:
-  `prolong/make` adds `orderIds`, every renewed order (`orderId` is the first of them);
-  `autoprolong/enable|disable` renamed `ids` to `ipIds` and added `orderIds`. See
+- **Renewal selection is per type now (breaking for `ipv6`, `mix` and `mix_isp`).** `ipv4`,
+  `isp` and `mobile` are still renewed per proxy, by `ids` (the proxy `id`) or `ips`
+  (addresses); when both are sent, the server renews by `ids` and ignores `ips`. `ipv6`, `mix`
+  and `mix_isp` are renewed only as whole orders, by `orderIds` (the `order_id`) instead of
+  `ids`: `ipv6` is no longer renewed by its `host:port`, and a MIX order is renewed with all of
+  its packages — `orderSeparatorIds` and `orderSeparatorId` were removed. A selection field of
+  the wrong kind is rejected with code 0 and an error naming the field to use
+  (`[ids] is not applicable for ipv6: prolong by [orderIds]`,
+  `[orderIds] is not applicable for ipv4: prolong by [ids]`), and an unknown or foreign order
+  fails the whole request with code 29 `Incorrect orderIds`. Residential auto-renewal takes no
+  selection at all. The SDK routes the second argument of `prolongCalc()`, `prolongMake()` and
+  `autoProlong*()` by type and drops empty lists. It raises `ValueError` on `orderSeparatorIds`
+  and `orderSeparatorId` (naming `orderIds` as the replacement), on proxy ids combined with
+  addresses, and on any selection for `resident` auto-renewal. Responses: `prolong/make` adds
+  `orderIds`, every renewed order (`orderId` is the first of them); `autoprolong/enable|disable`
+  adds `orderIds`, the orders of the proxies listed in `ids`. See
   [Renewing proxies](#renewing-proxies).
 - **`X-Fingerprint` is optional.** The server no longer requires the header for API-key orders,
   residential and scraper included, so the SDK no longer raises when no fingerprint is set. It
