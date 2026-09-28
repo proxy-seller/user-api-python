@@ -23,27 +23,35 @@ except ApiError as error:
 
 Nothing else is required — the client talks to `https://proxy-seller.com/personal/api/v2/` by
 default. Call `api.close()` when a context manager is not used. Configuration and payment/
-authorization state belong to each `Api` instance; they are not shared by clients.
+authorization state belong to each `Api` instance; they are not shared by clients. The same
+goes for the request queue: requests are paced by default so that the client stays within the
+API limits — see [Rate limits and the request queue](#rate-limits-and-the-request-queue).
 
 ### Paying for orders
 
-Every order and renewal needs a payment system. Take one from `balancePaymentsList()` and set it
-once:
+Orders and renewals are paid from the account balance or charged to the saved card, so they
+accept exactly two payment codes: `balance` and `paddle_subscription`. Set one once:
 
 ```python
-payments = api.balancePaymentsList()   # [{'id': '69e7…', 'name': 'PayPal'}, …]
-api.setPaymentId(payments[0]['id'])
+api.setPaymentCode('balance')   # or 'paddle_subscription' to charge the saved card
 ```
 
-This is the one place where an id is unavoidable: several payment systems share the same internal
-code (a single `cryptomus` covers "USDT (TRC-20)", "All cryptocurrencies" and more), so the code
-cannot tell them apart. Everywhere else you use human-readable codes.
+Any other payment system — a one-off card or crypto checkout — needs a browser redirect that a
+programmatic client cannot complete, so `order/*` and `prolong/*` reject it. `order/make`
+requires a payment; `order/calc` and `prolong/*` also work without one.
 
-### Residential and scraper orders need a fingerprint
+`balancePaymentsList()` is not the place to pick an order payment from: it lists the systems for
+topping the balance up with `balanceAdd()` and never includes the balance itself. That top-up is
+the one place where an id is unavoidable — several payment systems share the same code (a single
+`cryptomus` covers "USDT (TRC-20)", "All cryptocurrencies" and more), so the code cannot tell
+them apart; see [Balance and auto top-up](#balance-and-auto-top-up). Everywhere else you use
+human-readable codes.
 
-`order/make` carries an `X-Fingerprint` header. Most sections ignore it, but **residential and
-scraper orders are not created without it at all** — the order service answers `Header
-X-Fingerprint is required` and nothing is ordered.
+### Optional fingerprint
+
+`order/make` accepts an optional `X-Fingerprint` header. When present it is used for anti-fraud
+checks and affiliate attribution; **no section refuses an order without it**, residential and
+scraper included. The SDK sends the header only when you give it a value:
 
 ```python
 api = Api({'key': 'YOUR_API_KEY', 'fingerprint': 'my-installation-id'})
@@ -53,12 +61,10 @@ api.setFingerprint('my-installation-id')
 api.orderMakeResident('1-gb', fingerprint='my-installation-id')
 ```
 
-Any opaque string is accepted — the server does not validate its shape — but it must be a
-**stable identifier of your installation**. The SDK deliberately does not generate one: a value
-randomized per process would break the anti-fraud and affiliate attribution the header exists for.
-
-Ordering resident or scraper without a fingerprint raises `ValueError` locally, rather than
-spending a round trip on a request the server is certain to reject.
+Any opaque string is accepted — the server does not validate its shape — but if you send one,
+make it a **stable identifier of your installation**. The SDK deliberately does not generate
+one: a value randomized per process is useless for anti-fraud and attribution. Without a value
+the header is simply omitted.
 
 <details>
 <summary>Pointing the client at another host, and extra headers</summary>
@@ -66,7 +72,7 @@ spending a round trip on a request the server is certain to reject.
 ```python
 with Api({
     'key': 'YOUR_API_KEY',
-    'base_url': 'http://localhost:7995/personal/api/v2/',
+    'base_url': 'http://localhost:8080/personal/api/v2/',
     'headers': {'X-Request-Source': 'my-app'},
 }) as api:
     ...
@@ -90,8 +96,11 @@ key's allowlist and an exceeded rate limit all return **HTTP 200 with the same f
 ```
 
 So `errors[0].message` is always `Error api key`, and it does not tell you which of the three
-actually happened — always read the whole array. There is **no HTTP 429**: the rate limit
-(1000 requests per minute per key, calendar-minute window) arrives as the same triple.
+actually happened — always read the whole array. The API's own rate limit (1000 requests per
+minute per key, calendar-minute window) arrives as this same triple, **not as HTTP 429**. An
+HTTP 429 can only come from the edge in front of the API, before the request reached it; the
+client retries those by itself — see
+[Rate limits and the request queue](#rate-limits-and-the-request-queue).
 
 ```python
 try:
@@ -110,6 +119,80 @@ Two responses fall outside the envelope entirely:
   attachment body;
 * an invalid `ext` on a download is rejected with a bare plain-text HTTP 400. The library
   validates `ext` locally (`assertExt`) to avoid it: max 250 chars, no `CR`, `LF`, `/`, `\`.
+
+## Rate limits and the request queue
+
+The API accepts up to 1000 requests per minute per key. By default the client paces its own
+requests so that you stay inside that limit without any throttling code of your own, and it
+sends the requests that change something — above all the ones that spend money — one at a
+time.
+
+Every request falls into one of three groups by its endpoint path, not by HTTP method:
+`order/calc` and the other `*/calc` endpoints are `POST`, but they only read.
+
+| group | endpoints |
+|---|---|
+| money | `order/make`, `prolong/make/{type}`, `balance/add` |
+| write | `autoprolong/enable/{type}`, `autoprolong/disable/{type}`, `auth/add`, `auth/add/ip`, `auth/change`, `auth/delete`, `proxy/replace`, `proxy/comment/set`, `balance/autotopup/set`, `resident/list` (the alias of `resident/list/add`), `resident/list/{add,delete,rename,rotation,tools}`, `residentsubuser/{create,update,delete}`, `residentsubuser/list/{add,delete,rename,rotation,tools}` |
+| read | everything else: `*/list`, `*/get`, every `*/calc`, `reference/*`, `proxy/download/*`, `resident/package`, `resident/lists`, `resident/geo*`, `resident/consumption`, `resident/traffic/details`, `residentsubuser/packages`, `residentsubuser/lists`, `balance/payments/list`, `balance/autotopup/get` |
+
+What the client does, with the defaults:
+
+1. **A global window.** All requests together — read, write and money — start at most 1000
+   times within any 60 seconds. It is a sliding window over the start times of the last 1000
+   requests, not a token bucket: when it is full, the next request waits until the oldest of
+   them is 60 seconds old, so no burst ever goes beyond 1000 in 60 seconds.
+2. **One write at a time.** Write and money requests go through a single queue per client,
+   first come first served. Only one of them is in flight; the next one starts after the
+   previous one has finished, and no sooner than **1 second** after the previous write or
+   money request *started*. A money request also waits until **2 seconds** have passed since
+   the previous money request started. Reads never wait for this queue, only for the global
+   window.
+3. **HTTP 429 is retried.** A 429 comes from the edge in front of the API and means that the
+   request never reached the API, so repeating it is safe even for money requests. The client
+   waits for `Retry-After` (seconds or an HTTP date; 2 seconds when the header is missing or
+   unreadable; never longer than 60 seconds) and tries again, at most **3** times. After that
+   it raises the usual `ApiError` with `error.http_status == 429`. A retried write or money
+   request keeps its place in the queue, and every retry counts as a new start in the global
+   window.
+4. **Nothing else is retried.** Business errors reach you exactly as before. That includes
+   code `57`, `Prolong for this order is already in progress…`: another request is extending
+   that order right now, and a retry could extend it twice. It also includes the access-denied
+   triple (`Error api key` / `IP not allowed …` / `Request limit reached`, see
+   [Errors](#errors)), which cannot be told apart from a wrong key or IP. Network errors are
+   not retried either.
+
+Waiting blocks the calling thread, and the time spent in the queue is not part of `timeout`.
+The queue is thread-safe: threads that share one `Api` instance share its window and its write
+queue — writes are serialized, reads run in parallel.
+
+Change the numbers or switch the queue off with `rate_limit`:
+
+```python
+api = Api({
+    'key': 'YOUR_API_KEY',
+    'rate_limit': {
+        'requests_per_minute': 600,   # default 1000
+        'write_interval_ms': 1500,    # default 1000
+        'money_interval_ms': 3000,    # default 2000
+        'max_retries': 5,             # default 3; 0 turns the 429 retries off
+    },
+})
+
+api = Api({'key': 'YOUR_API_KEY', 'rate_limit': {'enabled': False}})  # or 'rate_limit': False
+```
+
+`'enabled': False` restores the previous behaviour exactly: no waiting and no retries, so a 429
+raises at once. The camelCase spellings (`requestsPerMinute`, `writeIntervalMs`,
+`moneyIntervalMs`, `maxRetries`, and `rateLimit` for the option itself) are accepted too; an
+unknown option raises `ValueError`.
+
+**The queue belongs to one `Api` instance.** Separate instances — in one process or in several
+processes, such as the workers of a multi-process server or several cron scripts — know
+nothing about each other's requests, even with the same key, so together they can still go
+over the limits. Share one instance per key where you can, or give each instance a share of
+`requests_per_minute`. Where several processes use a key at the same time, the server can
+still answer with code `57` or with the access-denied triple — handle them as described above.
 
 ## Identifiers
 
@@ -134,10 +217,9 @@ Two things in this list are not ObjectIds:
 
 Every reference argument of `order/*` and `prolong/*` takes **either an ObjectId or a code in
 the same `*Id` argument**: when the value is not a valid id and the matching `*Code` field is
-empty, the server resolves it as a code (`normalizeOrderReferenceCodes` /
-`normalizeProlongReferenceCodes`). The `*Code` keyword options are kept for compatibility, but
-nothing needs them — a code goes straight into `countryId`, `periodId`, `operatorId`, `mixId`,
-`tarifId`, `paymentId`.
+empty, the server resolves it as a code. The `*Code` keyword options are kept for
+compatibility, but nothing needs them — a code goes straight into `countryId`, `periodId`,
+`operatorId`, `mixId`, `tarifId`, `paymentId`.
 
 `rotationCode` is the exception in the other direction: it has no resolution step at all, it
 is only copied into `rotationId` after an integer check. Use `rotationId` and forget it.
@@ -155,7 +237,7 @@ ObjectId. Read `id`, put it in the matching `*Id` argument. That is the whole ru
 | `rotationId` | **minutes** as an integer, `0` = `By Link` — the one `id` that is a number, not a code | `country[].operators.*[].rotations[].id` *is* the minute value |
 | `mixId` | mix package code — exact match | `reference/list/mix` → `quantities[].id`, e.g. `europe-2-mix_IPv4`. First argument of `orderCalcMix()`/`orderMakeMix()` |
 | `tarifId` | resident tariff code — exact match, e.g. `1-gb` | `reference/list/resident` → `tarifs[].id` |
-| `paymentId` | payment-system ObjectId — the one unavoidable id | `balancePaymentsList()` → `id`, see "Paying for orders" above |
+| `paymentId` / `paymentCode` | `balance` or `paddle_subscription` (the saved card) — nothing else pays for orders and renewals | fixed codes, see "Paying for orders" above; `balancePaymentsList()` ids are for `balanceAdd()` only |
 
 ObjectIds are still accepted everywhere if you happen to have them; the reference simply no longer
 publishes them. `balance/add` is the one endpoint that resolves no codes at all — it needs a real
@@ -167,7 +249,7 @@ Reference values are passed positionally into the `*Id` arguments, as ObjectIds 
 `authorization` and `coupon` are the only arguments normally left as `None`.
 
 ```python
-api.setPaymentId('PAYMENT_ID')  # or setPaymentCode('balance')
+api.setPaymentCode('balance')  # or 'paddle_subscription' for the saved card
 
 # ipv4: customTargetName is mandatory, otherwise the call fails locally
 api.orderCalcIpv4('USA', '1m', 2, customTargetName='seo', uptime=True)
@@ -193,9 +275,9 @@ their `mixCode`/`periodCode` are exactly the values that `orderCalcMix()` alread
 positionally.
 
 `sectionCode` values: `ipv4`, `ipv6`, `mobile`, `isp`, `mix`, `mix_isp`, `resident`,
-`scraper`. `mobileServiceType` is required by the API and defaults to legacy-compatible
-`dedicated`. `uptime` is available for supported IPv4/ISP combinations.
-`setGenerateAuth('Y')` affects only `order/make`.
+`scraper`. `mobileServiceType` is required by the API and defaults to `dedicated`. `uptime` is
+available for supported IPv4/ISP combinations. `setGenerateAuth('Y')` affects only
+`order/make`.
 
 `customTargetName` is required for `ipv4`, `ipv6` and `isp` (the server answers
 `Incorrect goal`, code 14, without it) and is checked locally before the request. For
@@ -209,22 +291,30 @@ api.orderList(status='PAYED', sort_by='date_insert', order='desc', page=1, limit
 api.orderList()  # the same call with no filters at all
 ```
 
-Every filter is optional and every name is the snake_case one of v1: `order_id`, `start_date`,
-`end_date`, `status` (`PAYED` | `NOT_PAYED` | `RETURN` — the `status_type` of the response),
-`is_extend`, `auto_order`, `page`, `limit`, `sort_by` (`date_insert` | `summ` | `status`) and
-`order` (`asc` | `desc`). The same endpoint answers legacy-API clients through the reverse
-mirror, so the spelling is theirs.
+Every filter is optional. Query filters and response fields of `order/list` use snake_case
+names such as `start_date` and `is_extend`, and the SDK sends them exactly as given:
+`order_id`, `start_date`, `end_date`, `status` (`PAYED` | `NOT_PAYED` | `RETURN` — the
+`status_type` of the response), `is_extend`, `auto_order`, `page`, `limit`, `sort_by`
+(`date_insert` | `summ` | `status`) and `order` (`asc` | `desc`).
 
 The result is not a flat list but a `metadata` + `items` pair, and `metadata` is always there:
 without `limit` it reports `total_pages: 1`, `current_limit: 0` and the whole list in `items`.
 `summ` and `items[]['price']` are **strings with the currency already in them** (`'$25.00'`),
-`auto_order` and `is_extend` are `'Y'`/`'N'` rather than booleans, and the dates are ISO 8601 with offset (`2026-09-01T14:15:26+00:00`)
-strings. `id` is the legacy bitrix number as a string; the ObjectId is `order_id` — the same value
-`proxyList()` returns as `order_id`.
+`auto_order` and `is_extend` are `'Y'`/`'N'` rather than booleans, and the dates are ISO 8601
+strings with offset (`2026-09-01T14:15:26+00:00`). `id` is a numeric order ID sent as a string;
+the ObjectId is `order_id` — the same value `proxyList()` returns as `order_id`, and the one
+`ipv6`, `mix` and `mix_isp` are renewed by (see [Renewing proxies](#renewing-proxies)).
 
 ## Renewing proxies
 
-Renew by the addresses themselves — the same strings `proxyList()` gives you. No ids to look up:
+What you renew by depends on the proxy type, and every value comes straight out of
+`proxyList()`:
+
+| type | pass this | from a `proxyList()` item | sent as |
+|---|---|---|---|
+| `ipv4`, `isp` | the address `1.2.3.4`, or the proxy id | `item['ip']`, or `item['id']` | `ips` / `ipIds` |
+| `mobile` | the address `ip:port_http:port_socks`, or the proxy id | `item['ip']`, `item['port_http']`, `item['port_socks']`, or `item['id']` | `ips` / `ipIds` |
+| `ipv6`, `mix`, `mix_isp` | the order id | `item['order_id']` (also `order_id` in `orderList()`) | `orderIds` |
 
 ```python
 ipv4 = api.proxyList('ipv4')['items']
@@ -238,18 +328,7 @@ api.prolongMake('ipv4', ips, '1m')           # deducts money
 `prolongMake()` raises `ApiError` with the server's warning — it never reports a renewal that did
 not happen.
 
-What to pass follows the proxy type, and every value comes straight out of `proxyList()`:
-
-| type | pass this | built from |
-|---|---|---|
-| `ipv4`, `isp`, `mix`, `mix_isp` | the address, `1.2.3.4` | `item['ip']` |
-| `ipv6` | the address, `host:port` — `1.2.3.4:26000` | `item['ip']` |
-| `mobile` | the address, `ip:port_http:port_socks` | `item['ip']`, `item['port_http']`, `item['port_socks']` |
-
-For `ipv6` the `ip` field already carries the gateway together with the port
-(`1.2.3.4:26000`), while `ip_only` holds the bare gateway — what the API publishes is the
-gateway, not the IPv6 address itself. So `ip` is passed as it comes, exactly like every other
-type; only `mobile` has to be assembled, out of the three fields above:
+A `mobile` address has to be assembled out of the three fields above:
 
 ```python
 mobile = api.proxyList('mobile')['items']
@@ -258,25 +337,62 @@ addresses = ['{}:{}:{}'.format(item['ip'], item['port_http'], item['port_socks']
 api.prolongCalc('mobile', addresses, '1m')
 ```
 
-ObjectId strings work for every type, and a mixed list works — each value is routed by its shape
-(an id is 24 hex characters, with no dot and no colon, so it goes into `ids` on its own). The
-period takes a code (`'1m'`), same fallback as `order/*`, and the fourth argument is a coupon.
+**`ipv6`, `mix` and `mix_isp` are renewed as whole orders by `orderIds`.** Pass the `order_id`
+of each order: every active proxy of that type in it is renewed (for `mix`/`mix_isp` — the mix
+packages of the order), and `quantity` / `items` of `prolongCalc()` show everything the quote
+covers.
+
+```python
+ipv6 = api.proxyList('ipv6')['items']
+orders = sorted({item['order_id'] for item in ipv6})
+
+api.prolongCalc('ipv6', orders, '1m')
+result = api.prolongMake('ipv6', orders, '1m')
+result['orderIds']                           # every renewed order
+```
+
+If any of the orders is not yours or has no active proxy of that type, the whole request fails
+with code 29 `Incorrect orderIds` and nothing is renewed. Addresses are not accepted for these
+types — `ipv6` is no longer renewed by its `host:port` — and the server rejects a selection
+field of the wrong kind with an error naming it, e.g.
+`[ips] is not applicable for ipv6: prolong by [orderIds]`.
+
+How the second argument is routed: a value with a dot or a colon is an address and goes to
+`ips`; anything else is an id — `ipIds` for `ipv4`/`isp`/`mobile`, `orderIds` for
+`ipv6`/`mix`/`mix_isp`. A list and a comma-separated string both work; empty values are
+skipped, and an empty selection is not sent at all. Do not mix proxy ids and addresses in one
+call: when `ipIds` is present the server ignores `ips`, so the SDK raises `ValueError` rather
+than letting the addresses drop out silently. The argument is still named `ids`, so existing
+positional and keyword calls keep working; it only means "what to renew" and never reaches the
+wire under that name.
+
+The period takes a code (`'1m'`), same fallback as `order/*`, and the fourth argument is a coupon.
+
+`prolongMake()` returns `{orderId, orderIds, total, listBaseOrderNumbers, balance}`. One request
+can renew several orders: `orderIds` lists every renewed one, `orderId` is the first of them and
+stays for compatibility, and `listBaseOrderNumbers` holds one base order number per renewed order
+(per package for `mix`/`mix_isp`), matching `base_order_number` in `orderList()`.
 
 <details>
-<summary>Renewing part of a MIX order</summary>
+<summary>The selection fields as keywords</summary>
 
-A MIX order can be split into parts that renew independently. Those parts are addressed by id,
-passed as keywords:
+The request fields can also be passed as they go on the wire:
 
 ```python
 api.prolongMake(
-    'mix', orderSeparatorIds=['SEPARATOR_ID'],
-    periodId='1m', coupon='SALE10')
+    'mix', orderIds=['ORDER_ID'],
+    periodId='1m', paymentId='balance', coupon='SALE10')
 ```
 
-The keyword form also exposes the complete v2 payload: `ips`, `ids`, `orderSeparatorId`,
-`orderSeparatorIds`, `periodId`, `paymentId`, and `coupon`. Types: `ipv4`, `ipv6`, `mobile`,
-`isp`, `mix`, `mix_isp`.
+Accepted: `ipIds`, `ips`, `orderIds`, `periodId`/`periodCode`, `paymentId`/`paymentCode` and
+`coupon`; an explicit value wins over the one routed from the second argument. Types: `ipv4`,
+`ipv6`, `mobile`, `isp`, `mix`, `mix_isp`.
+
+`ids`, `orderSeparatorIds` and `orderSeparatorId` were removed from the API. Passed as keywords,
+in `options` or in the payload dict, they raise `ValueError` naming the replacement instead of
+being dropped: `ids` → `ipIds` (`ipv4`/`isp`/`mobile`) or `orderIds` (`ipv6`/`mix`/`mix_isp`),
+`orderSeparatorIds`/`orderSeparatorId` → `orderIds`. This is only about those keys — the second
+positional argument is still named `ids` and works as described above.
 
 </details>
 
@@ -289,7 +405,12 @@ you present — a separate branch of the API, not a flag on prolong.
 api.autoProlongCalc('ipv4', ['1.2.3.4'], '1m', paymentId='balance')
 api.autoProlongEnable('ipv4', ['1.2.3.4'], '1m', paymentId='balance')
 api.autoProlongDisable('ipv4', ['1.2.3.4'])
+
+api.autoProlongEnable('mix', ['ORDER_ID'], '1m', paymentId='balance')   # whole orders
 ```
+
+The selection works exactly as in [Renewing proxies](#renewing-proxies): addresses or proxy ids
+for `ipv4`, `isp` and `mobile`, the `order_id` for `ipv6`, `mix` and `mix_isp`.
 
 `paymentId` is **mandatory** for `calc` and `enable` — the charge happens while you are away, so
 the payment system cannot be guessed. Only `balance` and `paddle_subscription` are accepted: a
@@ -304,15 +425,21 @@ api.autoProlongEnable('resident', paymentId='balance', tarifId='trial')
 api.autoProlongDisable('resident')
 ```
 
+A selection passed with `resident` raises `ValueError` locally (the server rejects it with
+`[ipIds] is not applicable for resident: auto-prolong applies to the whole package`): dropping it
+silently would switch the whole package while you meant single addresses.
+
 Three things about the answers before you parse them:
 
-* **`ids` is not an echo.** For `ipv6` the whole order is switched at once, so `quantity` and
-  `ids` can cover more proxies than you sent.
+* **`ipIds` is not an echo.** `enable` and `disable` report what was actually switched:
+  `quantity`, `ipIds` (the proxies) and `orderIds` (their orders). For `ipv6`, `mix` and
+  `mix_isp` that is every active proxy of the orders you sent; for `resident` `quantity` is 1
+  and both lists are empty. The proxy list used to be called `ids`.
 * **Not enough money is not an exception.** `calc` answers `status: "error"` with a *filled*
   `data` and an empty `errors[]` — the same shape `prolong/calc` uses. Read `data['warning']`.
-* **Residential fills different fields.** `days` and `chargeDate` are `None` there (a package
-  renews on expiry *or* on traffic exhaustion, so no single date describes it); `tarifId` and
-  `dateEnd` carry the meaning instead.
+* **Residential fills different fields.** `chargeDate` is `None` there (a package renews on
+  expiry *or* on traffic exhaustion, so no single date describes it); `dateEnd`, `tarifId` and
+  `days` — the tariff's own period — carry the meaning instead.
 
 `scraper` has no auto-renewal: it is extended by buying traffic through `order/make`.
 
@@ -401,9 +528,9 @@ import json
 geo = json.loads(api.residentGeo().decode('utf-8'))
 ```
 
-`residentListAdd()` accepts the legacy positional form or the full dictionary with
+`residentListAdd()` accepts positional arguments or the full dictionary with
 `title`, `whitelist`, `geo`, `export`, and `rotation`. `geo` must be an **object**
-(`{'country', 'region', 'city', 'isp'}`) — the server binds `GeoDto`, an array is rejected;
+(`{'country', 'region', 'city', 'isp'}`) — the server expects an object and rejects an array;
 an empty geo is valid and means "no geo filter".
 
 ```python
@@ -450,15 +577,16 @@ api.residentSubUserListDelete('PACKAGE_KEY', 561)  # {'status': 'delete'} | {'st
 
 Changes made after the 2.0 release, in the order the server shipped them:
 
-- **`order/list` is new** — `orderList()`, see [Listing orders](#listing-orders). Its filters keep
-  the v1 snake_case names because legacy-API clients reach the same endpoint through the reverse
-  mirror, and its `data` is a `metadata` + `items` pair rather than a flat list.
+- **`order/list` is new** — `orderList()`, see [Listing orders](#listing-orders). Its query
+  filters and response fields use snake_case names such as `start_date` and `is_extend`, and its
+  `data` is a `metadata` + `items` pair rather than a flat list.
 - **`resident/autorenew/{enable,disable,calculate}` were removed** and replaced by
   `autoprolong/{calc,enable,disable}/{type}` — see [Automatic renewal](#automatic-renewal).
   `type='resident'` is the residential branch of the same three endpoints.
-- **`order/make` requires `X-Fingerprint`** for residential and scraper orders. The SDK can now
-  send it; without a value those two sections raise locally instead of being rejected by the
-  server.
+- **`order/make` gained the `X-Fingerprint` header.** The SDK can send it (config,
+  `setFingerprint()` or per call). At the time the server refused residential and scraper orders
+  without it and the SDK raised locally for those two sections; that requirement is gone — see
+  the last entry.
 - **`dailyCountCap` / `monthlyAmountCap` were removed** from `balance/autotopup/set`
   (2026-08-18). The server ignores them, so the SDK now raises `ValueError` rather than letting
   the call look successful while changing nothing. Error codes 54 and 55 are gone with them.
@@ -471,6 +599,32 @@ Changes made after the 2.0 release, in the order the server shipped them:
   `errors[{code: 16}]` and raise like any other business error; a legitimate success with an
   empty `orderId` is returned intact instead of being turned into a false failure after the
   money has already been taken.
+- **Renewal selection is per type now, and its fields were renamed (breaking).** `prolong/*` and
+  `autoprolong/*` no longer read `ids`, `orderSeparatorIds` or `orderSeparatorId`. `ipv4`, `isp`
+  and `mobile` are renewed per proxy by `ipIds` (the proxy `id`) or `ips` (addresses); `ipv6`,
+  `mix` and `mix_isp` only as whole orders by `orderIds` (the `order_id`), so `ipv6` is no longer
+  renewed by its `host:port`, and a MIX order is renewed with all of its packages rather than by
+  separator ids. A selection field of the wrong kind is rejected by name
+  (`[ipIds] is not applicable for ipv6: prolong by [orderIds]`), and an unknown or foreign order
+  fails the whole request with code 29 `Incorrect orderIds`. The SDK routes the second argument
+  of `prolongCalc()`, `prolongMake()` and `autoProlong*()` by type — the parameter keeps its name
+  `ids` — and drops empty lists. It raises `ValueError` when the removed fields are passed as
+  keywords, in `options` or in the payload dict (naming `ipIds`/`orderIds` as the replacement),
+  on a mix of proxy ids and addresses, and on any selection for `resident` auto-renewal. Responses:
+  `prolong/make` adds `orderIds`, every renewed order (`orderId` is the first of them);
+  `autoprolong/enable|disable` renamed `ids` to `ipIds` and added `orderIds`. See
+  [Renewing proxies](#renewing-proxies).
+- **`X-Fingerprint` is optional.** The server no longer requires the header for API-key orders,
+  residential and scraper included, so the SDK no longer raises when no fingerprint is set. It
+  still sends the header whenever you provide a value — see
+  [Optional fingerprint](#optional-fingerprint).
+- **Behaviour change: requests are now paced by default** (see
+  [Rate limits and the request queue](#rate-limits-and-the-request-queue)). The client starts
+  at most 1000 requests in any 60 seconds, sends write and money requests one at a time (1 s
+  apart, money requests 2 s apart) and retries an HTTP 429 from the edge up to 3 times after
+  `Retry-After`, so a call can now block the calling thread for a while. Nothing else is
+  retried. `'rate_limit': {'enabled': False}` in the config restores the previous behaviour
+  exactly.
 
 ## Tests
 

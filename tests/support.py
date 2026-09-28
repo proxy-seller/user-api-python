@@ -1,10 +1,39 @@
 """
 Фейковый транспорт для офлайн-тестов: полностью повторяет то, что Api.request ждёт от
 requests.Session (метод request(...) -> объект с status_code/headers/json()/text/content).
-Сеть не задействована.
+Сеть не задействована. FakeClock — фейковое время для очереди запросов (RateLimiter).
 """
 
+import threading
+
 NO_JSON = object()
+
+
+class FakeClock:
+    """
+    Фейковые часы для очереди запросов: monotonic() отдаёт текущее время, sleep() мгновенно
+    сдвигает его вперёд и запоминает каждую паузу в sleeps. Потокобезопасны. Отсчёт с нуля —
+    так заметен баг "нет предыдущего старта" == 0.
+    """
+
+    def __init__(self, start=0.0):
+        self._now = float(start)
+        self.sleeps = []
+        self._lock = threading.Lock()
+
+    def monotonic(self):
+        with self._lock:
+            return self._now
+
+    def sleep(self, seconds):
+        with self._lock:
+            self.sleeps.append(seconds)
+            self._now += seconds
+
+    def advance(self, seconds):
+        """Время, прошедшее само (пользователь ничего не отправлял) — в sleeps не пишется."""
+        with self._lock:
+            self._now += seconds
 
 
 class FakeResponse:
@@ -22,19 +51,36 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Записывает вызовы и отдаёт заранее подготовленные ответы."""
+    """
+    Записывает вызовы и отдаёт заранее подготовленные ответы. Исключение в списке ответов
+    бросается вместо ответа (транспортная ошибка).
 
-    def __init__(self, responses=None):
+    С clock каждый вызов получает поле 'at' — момент старта по фейковым часам, а latency
+    сдвигает часы на длительность запроса.
+    """
+
+    def __init__(self, responses=None, clock=None, latency=0.0):
         self.calls = []
         self.responses = list(responses or [])
         self.closed = False
+        self.clock = clock
+        self.latency = latency
+        self._lock = threading.Lock()
 
     def request(self, method, url, **kwargs):
         call = {'method': method, 'url': url}
         call.update(kwargs)
-        self.calls.append(call)
-        if self.responses:
-            return self.responses.pop(0)
+        with self._lock:
+            if self.clock is not None:
+                call['at'] = self.clock.monotonic()
+            self.calls.append(call)
+            response = self.responses.pop(0) if self.responses else None
+        if self.clock is not None and self.latency:
+            self.clock.advance(self.latency)
+        if isinstance(response, BaseException):
+            raise response
+        if response is not None:
+            return response
         return FakeResponse({'status': 'success', 'data': {}, 'errors': []})
 
     def close(self):

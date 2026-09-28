@@ -1,4 +1,12 @@
 import json
+import math
+import re
+import threading
+import time
+from collections import deque
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
 import requests
 from urllib.parse import quote
 
@@ -26,9 +34,9 @@ class ApiError(Exception):
     Client API v2 почти всегда отвечает HTTP 200, а ошибка лежит в конверте
     ``{status, data, errors}``. ``message``/``code``/``custom_data`` — это errors[0],
     но ошибки доступа приходят фиксированной ТРОЙКОЙ
-    (``Error api key`` / ``IP not allowed <ip>`` / ``Request limit reached``, все с code 503,
-    см. LegacyClientApiErrorHelper.legacyAccessErrors на бэкенде), поэтому по errors[0]
-    нельзя отличить битый ключ от неразрешённого IP и от превышения лимита запросов.
+    (``Error api key`` / ``IP not allowed <ip>`` / ``Request limit reached``, все с code 503),
+    поэтому по errors[0] нельзя отличить битый ключ от неразрешённого IP и от превышения
+    лимита запросов.
     Полный массив доступен в ``errors``.
     """
 
@@ -47,7 +55,9 @@ class ApiError(Exception):
     def isAccessError(self):
         """
         True, если это тройка ошибок доступа (битый ключ / IP не разрешён / rate limit).
-        HTTP 429 в v2 не существует: лимит приходит теми же HTTP 200 + "Error api key".
+        Сам API не отвечает HTTP 429: его лимит приходит той же тройкой с HTTP 200. HTTP 429
+        бывает только от edge перед API (запрос до API не дошёл) — такие ответы SDK
+        повторяет сам, см. RateLimiter; тройку он не повторяет никогда.
         """
         messages = [
             str((item or {}).get('message') or '')
@@ -63,23 +73,357 @@ class ApiError(Exception):
             for message in messages)
 
 
+class RateLimiter:
+    """
+    Client-side request queue of one Api instance. Api builds it from the ``rate_limit``
+    config option and sends every HTTP request through run(), so the client stays within the
+    API limits without any throttling code on the caller's side (README, "Rate limits and the
+    request queue").
+
+    Правила, в скобках значения по умолчанию:
+
+    1. Глобальное окно. Все запросы (read, write и money вместе) делят скользящее окно: не
+       больше ``requests_per_minute`` [1000] стартов за любые 60 секунд. Это журнал стартов:
+       когда в нём N записей, следующий запрос ждёт, пока старейшей не исполнится 60 секунд.
+       Не token bucket — bucket пропускает всплески, при которых за 60 секунд уходит больше N.
+    2. Полоса записи. write и money идут через ОДНУ очередь на клиента: в полёте не больше
+       одного, следующий стартует только после завершения предыдущего и не раньше
+       ``write_interval_ms`` [1000] после СТАРТА предыдущего write/money, а money — ещё и не
+       раньше ``money_interval_ms`` [2000] после старта предыдущего money. Очередь FIFO.
+       Чтения полосу не ждут — только окно.
+    3. HTTP 429 — лимит edge перед API: запрос до API не дошёл, поэтому повтор безопасен даже
+       для money. Ждём Retry-After (секунды либо HTTP-дата; заголовка нет или он не
+       разбирается — 2 с; не дольше 60 с) и повторяем, не больше ``max_retries`` [3] раз;
+       последний 429 разбирается как обычно и становится ApiError с http_status=429. Повтор
+       write/money не уступает своё место в полосе (никто не проскакивает вперёд), и каждая
+       попытка — новый старт в окне; интервалы полосы отсчитываются от старта последней
+       попытки: предыдущие до API не дошли.
+    4. Других автоматических повторов нет: ошибки конверта (code 57 "Prolong for this order
+       is already in progress", тройка отказа в доступе с code 503) и транспортные ошибки
+       уходят вызывающему как раньше.
+
+    ``enabled=False`` возвращает прежнее поведение один в один: ни ожиданий, ни повторов.
+
+    Состояние живёт в экземпляре (один Api — один ключ): другие экземпляры и процессы с тем
+    же ключом о нём не знают. Потокобезопасен: ожидание блокирует вызывающий поток и идёт без
+    busy-wait — очередь полосы ждёт на Condition, паузы по времени идут через sleep().
+    ``clock`` и ``sleep`` подменяются в тестах (по умолчанию time.monotonic и time.sleep).
+    """
+
+    READ = 'read'
+    WRITE = 'write'
+    MONEY = 'money'
+    CATEGORIES = (READ, WRITE, MONEY)
+
+    #: Длина глобального окна, секунды.
+    WINDOW_SECONDS = 60.0
+    #: Пауза перед повтором 429, если Retry-After нет или он не разбирается, секунды.
+    DEFAULT_RETRY_AFTER_SECONDS = 2.0
+    #: Потолок паузы по Retry-After, секунды.
+    MAX_RETRY_AFTER_SECONDS = 60.0
+
+    #: Опции ключа ``rate_limit`` конфига Api.
+    OPTIONS = ('enabled', 'requests_per_minute', 'write_interval_ms', 'money_interval_ms',
+               'max_retries', 'clock', 'sleep')
+    #: Те же опции в camelCase, как в остальных SDK, — алиасы.
+    OPTION_ALIASES = {
+        'requestsPerMinute': 'requests_per_minute', 'writeIntervalMs': 'write_interval_ms',
+        'moneyIntervalMs': 'money_interval_ms', 'maxRetries': 'max_retries'}
+
+    def __init__(self, enabled=True, requests_per_minute=1000, write_interval_ms=1000,
+                 money_interval_ms=2000, max_retries=3, clock=None, sleep=None):
+        if not isinstance(enabled, bool):
+            raise ValueError(
+                'rate_limit enabled must be True or False, got {!r}'.format(enabled))
+        self.enabled = enabled
+        self.requests_per_minute = self._option(
+            'requests_per_minute', requests_per_minute, integer=True, minimum=1)
+        self.write_interval_ms = self._option('write_interval_ms', write_interval_ms)
+        self.money_interval_ms = self._option('money_interval_ms', money_interval_ms)
+        self.max_retries = self._option('max_retries', max_retries, integer=True)
+        for name, value in (('clock', clock), ('sleep', sleep)):
+            if value is not None and not callable(value):
+                raise TypeError('rate_limit {} must be callable'.format(name))
+        self._clock = clock if clock is not None else time.monotonic
+        self._sleep = sleep if sleep is not None else time.sleep
+        self._write_interval = self.write_interval_ms / 1000.0
+        self._money_interval = self.money_interval_ms / 1000.0
+        # Один замок на всё состояние; под ним никогда не спим и не отправляем.
+        self._cond = threading.Condition(threading.Lock())
+        self._starts = deque()          # старты в глобальном окне, по возрастанию
+        self._lane = deque()            # очередь полосы записи; голова владеет полосой
+        self._last_write_start = None   # старт последней попытки write/money
+        self._last_money_start = None   # старт последней попытки money
+
+    @staticmethod
+    def _option(name, value, integer=False, minimum=0):
+        kinds = (int,) if integer else (int, float)
+        if (isinstance(value, bool) or not isinstance(value, kinds)
+                or (isinstance(value, float) and not math.isfinite(value))
+                or value < minimum):
+            raise ValueError('rate_limit {} must be {} >= {}, got {!r}'.format(
+                name, 'an integer' if integer else 'a number', minimum, value))
+        return value
+
+    @classmethod
+    def _from_config(cls, value):
+        """
+        Очередь из опции ``rate_limit`` конфига Api: None или True — значения по умолчанию,
+        False — выключена, dict — опции OPTIONS (camelCase из OPTION_ALIASES тоже годится).
+        Неизвестная опция — ValueError, а не молча оставленное значение по умолчанию.
+        """
+        if value is None or value is True:
+            return cls()
+        if value is False:
+            return cls(enabled=False)
+        if not isinstance(value, dict):
+            raise TypeError('rate_limit must be a dict of options or True/False, got {}'.format(
+                type(value).__name__))
+        options = {}
+        for key, option in value.items():
+            name = cls.OPTION_ALIASES.get(key, key)
+            if name not in cls.OPTIONS:
+                raise ValueError('unknown rate_limit option {!r}, expected one of: {}'.format(
+                    key, ', '.join(cls.OPTIONS)))
+            if name in options:
+                alias = next(alias for alias, target in cls.OPTION_ALIASES.items()
+                             if target == name)
+                raise ValueError('pass either {} or {} in rate_limit, not both'.format(
+                    name, alias))
+            options[name] = option
+        return cls(**options)
+
+    def run(self, category, send):
+        """
+        Выполнить одну HTTP-отправку по правилам очереди.
+
+        Args:
+            category (str): READ | WRITE | MONEY — см. Api.requestCategory().
+            send (callable): отправка без аргументов, возвращает ответ со ``status_code``.
+
+        Returns:
+            Ответ последней попытки: обычный — либо 429, если повторы исчерпаны.
+        """
+        if not self.enabled:
+            return send()
+        if category not in self.CATEGORIES:
+            raise ValueError('unknown request category {!r}'.format(category))
+        if category == self.READ:
+            return self._send(category, send)
+        token = self._enter_lane()
+        try:
+            self._wait_for_lane_interval(category == self.MONEY)
+            return self._send(category, send)
+        finally:
+            self._leave_lane(token)
+
+    def _send(self, category, send):
+        """Попытки одного запроса: повторяется только HTTP 429, и не больше max_retries раз."""
+        retries = 0
+        while True:
+            self._take_window_slot(category)
+            response = send()
+            if getattr(response, 'status_code', None) != 429 or retries >= self.max_retries:
+                return response
+            retries += 1
+            delay = self._retry_after(response)
+            self._discard(response)
+            if delay > 0:
+                self._sleep(delay)
+
+    def _take_window_slot(self, category):
+        """
+        Дождаться места в глобальном окне и записать старт — атомарно, чтобы два потока не
+        заняли одно место. Для write/money этот же момент — старт в полосе.
+        """
+        while True:
+            with self._cond:
+                now = self._clock()
+                while self._starts and self._starts[0] + self.WINDOW_SECONDS <= now:
+                    self._starts.popleft()
+                if len(self._starts) < self.requests_per_minute:
+                    self._starts.append(now)
+                    if category != self.READ:
+                        self._last_write_start = now
+                        if category == self.MONEY:
+                            self._last_money_start = now
+                    return
+                delay = self._starts[0] + self.WINDOW_SECONDS - now
+            self._sleep(delay)
+
+    def _wait_for_lane_interval(self, money):
+        """Держатель полосы ждёт интервалы от стартов предыдущих write/money и money."""
+        while True:
+            with self._cond:
+                now = self._clock()
+                ready = now
+                if self._last_write_start is not None:
+                    ready = max(ready, self._last_write_start + self._write_interval)
+                if money and self._last_money_start is not None:
+                    ready = max(ready, self._last_money_start + self._money_interval)
+                if ready <= now:
+                    return
+            self._sleep(ready - now)
+
+    def _enter_lane(self):
+        """Встать в очередь полосы и дождаться своей очереди (FIFO, без опроса)."""
+        token = object()
+        with self._cond:
+            self._lane.append(token)
+            try:
+                while self._lane[0] is not token:
+                    self._cond.wait()
+            except BaseException:
+                # Прерванное ожидание (KeyboardInterrupt и т.п.) не должно запереть полосу.
+                self._remove_from_lane(token)
+                raise
+        return token
+
+    def _leave_lane(self, token):
+        with self._cond:
+            self._remove_from_lane(token)
+
+    def _remove_from_lane(self, token):
+        """Вызывается под self._cond."""
+        was_head = self._lane[0] is token
+        self._lane.remove(token)
+        if was_head:
+            self._cond.notify_all()
+
+    @classmethod
+    def _retry_after(cls, response):
+        """
+        Пауза перед повтором 429 по Retry-After: целые секунды либо HTTP-дата. Дата
+        отсчитывается от заголовка Date того же ответа (так не мешает расхождение часов
+        клиента и сервера), без него — от текущего времени. Заголовка нет или он не
+        разбирается — DEFAULT_RETRY_AFTER_SECONDS; результат ограничен [0,
+        MAX_RETRY_AFTER_SECONDS].
+        """
+        value = cls._header(response, 'Retry-After')
+        delay = None
+        if value is not None:
+            text = str(value).strip()
+            if re.fullmatch(r'[0-9]+', text):
+                try:
+                    delay = float(int(text))
+                except (ValueError, OverflowError):
+                    # Число длиннее лимита int() — заведомо больше потолка.
+                    delay = cls.MAX_RETRY_AFTER_SECONDS
+            else:
+                moment = cls._http_date(text)
+                if moment is not None:
+                    reference = cls._http_date(cls._header(response, 'Date'))
+                    if reference is None:
+                        reference = datetime.now(timezone.utc)
+                    delay = (moment - reference).total_seconds()
+        if delay is None:
+            delay = cls.DEFAULT_RETRY_AFTER_SECONDS
+        return min(max(delay, 0.0), cls.MAX_RETRY_AFTER_SECONDS)
+
+    @staticmethod
+    def _http_date(value):
+        if value is None:
+            return None
+        try:
+            moment = parsedate_to_datetime(str(value).strip())
+        except Exception:
+            # Python < 3.10 бросает TypeError, новее — ValueError; заголовок чужой, не падаем.
+            return None
+        if moment is None:
+            return None
+        if moment.tzinfo is None:
+            # HTTP-дата всегда в GMT; asctime и "-0000" разбираются в наивное время.
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment
+
+    @staticmethod
+    def _header(response, name):
+        headers = getattr(response, 'headers', None) or {}
+        value = headers.get(name)
+        if value is None:
+            wanted = name.lower()
+            for key, item in headers.items():
+                if str(key).lower() == wanted:
+                    return item
+        return value
+
+    @staticmethod
+    def _discard(response):
+        """Отброшенный 429 закрываем: при stream=True он иначе держит соединение пула."""
+        close = getattr(response, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
 class Api:
     URL = 'https://proxy-seller.com/personal/api/v2/'
+
+    #: Категория каждого запроса для очереди (RateLimiter) — по ПУТИ, а не по HTTP-методу:
+    #: calc-ручки — POST, но только читают. {type} совпадает с любым одним сегментом пути.
+    #: Всё, чего здесь нет (*/list, */get, все */calc, reference/*, proxy/download/*,
+    #: resident/package|lists|geo*|consumption|traffic/details, residentsubuser/packages|lists,
+    #: balance/payments/list, balance/autotopup/get, …), — read.
+    REQUEST_CATEGORIES = {
+        'order/make': RateLimiter.MONEY,
+        'prolong/make/{type}': RateLimiter.MONEY,
+        'balance/add': RateLimiter.MONEY,
+        'autoprolong/enable/{type}': RateLimiter.WRITE,
+        'autoprolong/disable/{type}': RateLimiter.WRITE,
+        'auth/add': RateLimiter.WRITE,
+        'auth/add/ip': RateLimiter.WRITE,
+        'auth/change': RateLimiter.WRITE,
+        'auth/delete': RateLimiter.WRITE,
+        'proxy/replace': RateLimiter.WRITE,
+        'proxy/comment/set': RateLimiter.WRITE,
+        'balance/autotopup/set': RateLimiter.WRITE,
+        # POST-алиас resident/list/add
+        'resident/list': RateLimiter.WRITE,
+        'resident/list/add': RateLimiter.WRITE,
+        'resident/list/delete': RateLimiter.WRITE,
+        'resident/list/rename': RateLimiter.WRITE,
+        'resident/list/rotation': RateLimiter.WRITE,
+        'resident/list/tools': RateLimiter.WRITE,
+        'residentsubuser/create': RateLimiter.WRITE,
+        'residentsubuser/update': RateLimiter.WRITE,
+        'residentsubuser/delete': RateLimiter.WRITE,
+        'residentsubuser/list/add': RateLimiter.WRITE,
+        'residentsubuser/list/delete': RateLimiter.WRITE,
+        'residentsubuser/list/rename': RateLimiter.WRITE,
+        'residentsubuser/list/rotation': RateLimiter.WRITE,
+        'residentsubuser/list/tools': RateLimiter.WRITE,
+    }
 
     def __init__(self, config):
         """
         API key placed in https://proxy-seller.com/personal/api/.
 
         Args:
-            config (dict): Configuration options.
+            config (dict): Configuration options: key (required), base_url, timeout, headers,
+                request_options, session, fingerprint, rate_limit.
+
+                rate_limit — очередь запросов, ВКЛЮЧЕНА по умолчанию (см. RateLimiter):
+                dict с опциями enabled [True], requests_per_minute [1000],
+                write_interval_ms [1000], money_interval_ms [2000], max_retries [3]
+                (camelCase-написания тоже принимаются), либо False — выключить: прежнее
+                поведение без ожиданий и повторов.
 
         Raises:
-            Exception: If an error occurs during the configuration process.
+            ValueError: без key или при неверной опции rate_limit (неизвестное имя,
+                недопустимое значение).
+            TypeError: если rate_limit не dict и не True/False.
         """
 
         if 'key' not in config:
             raise ValueError(
                 "Need key, placed in https://proxy-seller.com/personal/api/")
+        if 'rate_limit' in config and 'rateLimit' in config:
+            raise ValueError('pass either rate_limit or rateLimit, not both')
+        # Очередь своя у каждого экземпляра: другие экземпляры с тем же ключом о ней не знают.
+        self.rate_limiter = RateLimiter._from_config(
+            config['rate_limit'] if 'rate_limit' in config else config.get('rateLimit'))
         api_root = config.get('base_url') or config.get('baseUrl') or config.get('baseURL') or self.URL
         self.base_uri = str(api_root).rstrip('/') + '/' + quote(str(config['key']), safe='') + '/'
         self.timeout = config.get('timeout', 30)
@@ -90,8 +434,7 @@ class Api:
         self.paymentCode = None
         self.generateAuth = 'N'
         # X-Fingerprint можно задать и прямо в headers — тогда он уйдёт со всеми запросами;
-        # подхватываем это значение, чтобы локальный гейт order/make не ругался на уже
-        # настроенный заголовок.
+        # подхватываем это значение, чтобы getFingerprint() видел уже настроенный заголовок.
         self.fingerprint = config.get('fingerprint') or self.headers.get('X-Fingerprint')
 
     def close(self):
@@ -107,11 +450,15 @@ class Api:
 
     def setPaymentId(self, id):
         """
-        Payment system id (MongoDB ObjectId from balance/payments/list).
+        Payment system for order/*, prolong/* and balance/add.
 
-        В order/* и prolong/* сюда можно положить и КОД платёжной системы (например
-        'balance'): сервер, не найдя ObjectId, резолвит значение как код. Исключение —
-        balance/add, он принимает только настоящий ObjectId (см. balanceAdd).
+        Заказы и продления оплачиваются только балансом или привязанной картой: здесь
+        подходят 'balance' и 'paddle_subscription' — код (сервер, не найдя ObjectId,
+        резолвит значение как код) либо ObjectId одной из этих двух систем; остальные
+        платёжки order/* и prolong/* отвергают. Проще setPaymentCode('balance').
+
+        balance/add, наоборот, принимает только настоящий ObjectId из balancePaymentsList()
+        (самого баланса в этом списке нет), см. balanceAdd.
         """
         self.paymentId = id
 
@@ -119,7 +466,10 @@ class Api:
         return self.paymentId
 
     def setPaymentCode(self, code):
-        """Set a stable payment-system code (for example ``balance``)."""
+        """
+        Payment-system code for order/* and prolong/*: ``balance`` (the account balance) or
+        ``paddle_subscription`` (the saved card) — other payment systems are rejected there.
+        """
         self.paymentCode = code
 
     def getPaymentCode(self):
@@ -142,15 +492,15 @@ class Api:
         """
         Значение заголовка X-Fingerprint для order/make.
 
-        Контракт (components.parameters.Fingerprint) требует СТАБИЛЬНЫЙ идентификатор
-        установки: форма не проверяется ("any opaque string is accepted"), но значение,
-        генерируемое заново на каждый процесс, ломает анти-фрод и affiliate-атрибуцию,
-        ради которых заголовок и введён. Поэтому SDK его не выдумывает — задайте свой
-        и сохраните между запусками.
+        Заголовок НЕОБЯЗАТЕЛЕН: ни одна секция, включая resident и scraper, не отказывает в
+        заказе без него. Если значение задано, SDK отправляет его с order/make, и сервер
+        использует его для анти-фрода и affiliate-атрибуции; если нет — заголовок просто не
+        уходит.
 
-        Для резидентских и скраперных заказов заголовок ОБЯЗАТЕЛЕН: без него
-        OrderService отвечает "Header X-Fingerprint is required" и заказ не создаётся.
-        Остальные секции его игнорируют, слать его всегда безопасно.
+        Отправляете — пусть это будет СТАБИЛЬНЫЙ идентификатор установки: форма не
+        проверяется (подойдёт любая строка), но значение, генерируемое заново на каждый
+        процесс, для анти-фрода и атрибуции бесполезно. Поэтому SDK его не выдумывает —
+        задайте свой и сохраните между запусками.
         """
         self.fingerprint = fingerprint
 
@@ -160,6 +510,11 @@ class Api:
     def request(self, method, uri, **options):
         """
         Send a request to the server.
+
+        Единственное место, где SDK отправляет HTTP: запрос проходит через очередь
+        (self.rate_limiter) с категорией requestCategory(uri) — может подождать места в окне
+        или в полосе записи, а HTTP 429 повторяется по Retry-After. Ожидание в очереди в
+        timeout не входит.
 
         Args:
             method (str): The HTTP method to use for the request.
@@ -175,15 +530,19 @@ class Api:
         request_options = {**self.request_options, **options}
         request_headers = {**self.headers, **request_options.pop('headers', {})}
         request_timeout = request_options.pop('timeout', self.timeout)
-        try:
-            response = self.session.request(
-                method, self.base_uri + uri, headers=request_headers,
-                timeout=request_timeout, **request_options)
-        except requests.RequestException as error:
-            error_response = getattr(error, 'response', None)
-            raise ApiError(
-                str(error), http_status=getattr(error_response, 'status_code', None),
-                body=getattr(error_response, 'content', None)) from error
+
+        def send():
+            try:
+                return self.session.request(
+                    method, self.base_uri + uri, headers=request_headers,
+                    timeout=request_timeout, **request_options)
+            except requests.RequestException as error:
+                error_response = getattr(error, 'response', None)
+                raise ApiError(
+                    str(error), http_status=getattr(error_response, 'status_code', None),
+                    body=getattr(error_response, 'content', None)) from error
+
+        response = self.rate_limiter.run(self.requestCategory(uri), send)
 
         content_type = response.headers.get('Content-Type', '').lower()
         content_disposition = response.headers.get('Content-Disposition', '').lower()
@@ -233,6 +592,26 @@ class Api:
             body=body,
             errors=errors if errors is not None else ([item] if item else []))
 
+    @classmethod
+    def requestCategory(cls, uri):
+        """
+        Категория запроса для очереди — по пути, через таблицу REQUEST_CATEGORIES.
+
+        Путь сравнивается без query-строки, без крайних и сдвоенных слэшей и без учёта
+        регистра; {type} в шаблоне совпадает с любым одним сегментом.
+
+        Returns:
+            str: 'money', 'write' или 'read' (RateLimiter.MONEY / WRITE / READ).
+        """
+        path = str(uri).split('?', 1)[0].split('#', 1)[0]
+        segments = [segment for segment in path.strip().lower().split('/') if segment]
+        for pattern, category in cls.REQUEST_CATEGORIES.items():
+            expected = pattern.split('/')
+            if len(expected) == len(segments) and all(
+                    want == '{type}' or want == got for want, got in zip(expected, segments)):
+                return category
+        return RateLimiter.READ
+
     @staticmethod
     def filterNone(params):
         """Drop None values, used for optional query filters."""
@@ -265,12 +644,12 @@ class Api:
     @staticmethod
     def _normalize_geo(geo):
         """
-        geo на бэкенде — ОБЪЕКТ (GeoDto: country/region/city/isp), не массив: см.
-        ListAddRequestDto.geo и CreatePackageListRequestDto.geo. Массив Jackson не свяжет,
-        и сервер ответит голым HTTP 400 мимо конверта.
+        geo в запросе resident/list/add и residentsubuser/list/add — ОБЪЕКТ
+        (country/region/city/isp), не массив: массив сервер с объектом не свяжет и запрос
+        отклонит.
 
         Пустой geo допустим (означает "без гео-фильтра"), поэтому None и пустая
-        последовательность приводятся к {}. Легаси-форму "массив из одного объекта"
+        последовательность приводятся к {}. Прежнюю форму "массив из одного объекта"
         разворачиваем в объект. Всё остальное — понятная локальная ошибка вместо
         AttributeError на .items().
         """
@@ -300,6 +679,16 @@ class Api:
         if any(c in ext for c in ('\r', '\n', '/', '\\')):
             raise ValueError("ext contains forbidden characters")
         return ext
+
+    @staticmethod
+    def _normalize_type(value):
+        """
+        Тип прокси из пути так, как его нормализует сервер: пробелы по краям отбрасываются,
+        регистр не важен, '-' и ' ' становятся '_' ('MIX-ISP' -> 'mix_isp').
+        """
+        if value is None:
+            return ''
+        return str(value).strip().lower().replace('-', '_').replace(' ', '_')
 
     # --------------------------- Auth ---------------------------
 
@@ -392,9 +781,8 @@ class Api:
         Raises:
             ValueError: если paymentId не задан, а задан только paymentCode. В отличие от
                 order/* и prolong/* эндпоинт balance/add НЕ резолвит код платёжной системы:
-                BalanceAddRequestClientDto знает только поля summ и paymentId, и
-                normalizeOrderReferenceCodes для него не вызывается. Раньше в этом случае
-                улетал paymentId=null и сервер отвечал "Payment id not exists".
+                он принимает только поля summ и paymentId. Раньше в этом случае улетал
+                paymentId=null и сервер отвечал "Payment id not exists".
 
         Returns:
             str: A link to the payment page.
@@ -425,7 +813,7 @@ class Api:
 
     # --------------------------- Balance auto top-up ---------------------------
 
-    #: Поля запроса balance/autotopup/set (AutoTopupSetRequestClientDto).
+    #: Поля запроса balance/autotopup/set.
     AUTO_TOPUP_FIELDS = ('enabled', 'threshold', 'amount', 'subscriptionId')
 
     #: Убраны из контракта 2026-08-18 вместе с кодами ошибок 54 и 55: лимиты списаний больше
@@ -439,7 +827,7 @@ class Api:
         Auto top-up configuration and current state.
 
         Returns:
-            dict: AutoTopupStateClientDto:
+            dict:
                 configured (bool), enabled (bool),
                 state (str): NO_PAYMENT_METHOD | DISABLED | ACTIVE | PAYMENT_INVALID |
                     PAUSED_FAILURES,
@@ -450,25 +838,24 @@ class Api:
                 paymentMethod (dict|None): {id, status ("active"/"expired"), paymentMethod
                     ("card"/"PayPal"/"Google Pay"/"Apple Pay"), brand, last4, exp ("MM/YYYY")},
                 failCount (int): подряд идущие неудачные списания,
-                lastAttemptAt: дата последней попытки или None (java.util.Date, при
-                    дефолтной сериализации Spring — строка ISO-8601),
+                lastAttemptAt: дата последней попытки (строка) или None,
                 lastEvent (dict|None): {status (TRIGGERED | SUCCEEDED | FAILED | SKIPPED_CAP |
                     SETTINGS_SAVED | PAUSED), amount, at (дата), reason (None для
                     SUCCEEDED)}.
 
         Raises:
             ApiError: code 49 ("Auto top-up is not available"), если фича выключена
-                серверным флагом enabled_autopopup_balance.
+                на сервере.
         """
         return self.request('GET', 'balance/autotopup/get')
 
     @classmethod
     def _assert_auto_topup_fields(cls, values):
         """
-        dailyCountCap и monthlyAmountCap удалены из контракта 2026-08-18
-        (AutoTopupSetRequestClientDto): сервер их игнорирует, коды ошибок 54/55 сняты и не
-        переиспользуются. Раньше вызов с ними проходил локальный гейт, возвращал success и не
-        делал ничего — ровно тот тихий no-op, который белый список полей и должен предотвращать.
+        dailyCountCap и monthlyAmountCap удалены из контракта balance/autotopup/set
+        2026-08-18: сервер их игнорирует, коды ошибок 54/55 сняты и не переиспользуются.
+        Раньше вызов с ними проходил локальный гейт, возвращал success и не делал ничего —
+        ровно тот тихий no-op, который белый список полей и должен предотвращать.
 
         Raises:
             ValueError: если в теле есть хотя бы одно из удалённых полей.
@@ -543,8 +930,8 @@ class Api:
 
         Args:
             type (str): The type of the proxy - ipv4, ipv6, mobile, isp, mix, mix_isp,
-                resident, scraper or None. Без типа приходят все разделы в том же порядке
-                ключей, что в v1: ipv4, ipv6, mobile, isp, mix, mix_isp, resident, scraper.
+                resident, scraper or None. Без типа приходят все разделы в фиксированном
+                порядке ключей: ipv4, ipv6, mobile, isp, mix, mix_isp, resident, scraper.
 
         Returns:
             dict: The guide information for creating an order. Идентификаторы внутри —
@@ -556,8 +943,7 @@ class Api:
 
                 Что реально приходит в ответе (не больше и не меньше):
                     country[]: id, name → id и ЕСТЬ alpha3-код страны, отдельного поля
-                        alpha3 сервер не отдаёт (ReferenceCountryClientDto знает только
-                        id и name);
+                        alpha3 сервер не отдаёт (у страны только id и name);
                     period[]: id, name ("1 month") → id и есть код периода;
                     mobile country[].operators.{dedicated,shared}[]: id, name, traffic,
                         rotations[{id, name}] → отдельного operatorCode нет, передавайте
@@ -580,14 +966,15 @@ class Api:
         return {'paymentId': self.getPaymentId()}
 
     #: Пары *Id/*Code для order/* и то, кто из них СТАРШЕ на сервере
-    #: (True = старше *Code). Список ровно из normalizeOrderReferenceCodes.
+    #: (True = старше *Code). Это все пары, которые сервер резолвит у order/*.
     ORDER_REFERENCE_PAIRS = (
         ('countryId', 'countryCode', True), ('periodId', 'periodCode', True),
         ('paymentId', 'paymentCode', True), ('mixId', 'mixCode', False),
         ('operatorId', 'operatorCode', False), ('rotationId', 'rotationCode', False),
         ('tarifId', 'tarifCode', False))
 
-    #: normalizeProlongReferenceCodes знает только период и платёжку, и у обеих пар старше *Code.
+    #: У prolong/* и autoprolong/* сервер резолвит только период и платёжку, и у обеих пар
+    #: старше *Code.
     PROLONG_REFERENCE_PAIRS = (
         ('periodId', 'periodCode', True), ('paymentId', 'paymentCode', True))
 
@@ -596,14 +983,13 @@ class Api:
         """
         Убирает лишнюю половину пары *Id/*Code — ровно по серверному приоритету.
 
-        У payment/country/period старше *Code: ветка кода на сервере срабатывает всегда, когда
-        код задан. У operator/rotation/mix/tarif старше *Id: там условие
-        ``if (xCode && !trimToNull(xId))``, то есть код применяется, ТОЛЬКО когда парный id пуст.
+        У payment/country/period старше *Code: сервер применяет код всегда, когда он задан.
+        У operator/rotation/mix/tarif старше *Id: код применяется, ТОЛЬКО когда парный id пуст.
         Раньше SDK выбрасывал *Id при ЛЮБОМ заданном *Code, и клиент, заполнивший обе половины,
         молча получал не тот пакет/оператора/ротацию/тариф, который выбрал бы сервер.
 
-        Пустая строка — это "не задано" (на сервере trimToNull), поэтому валидную парную
-        половину она не стирает.
+        Пустая строка (и строка из одних пробелов) для сервера — "не задано", поэтому валидную
+        парную половину она не стирает.
         """
         def filled(key):
             value = payload.get(key)
@@ -619,10 +1005,10 @@ class Api:
         Merge v2 identifiers/codes while avoiding conflicting id/code pairs.
 
         Отдельные *Code-поля нужны только для совместимости: у каждого *Id есть серверный
-        фолбэк (normalizeOrderReferenceCodes) — если значение не является валидным id, а
-        соответствующий *Code пуст, значение резолвится КАК КОД. Поэтому код достаточно
-        передать прямо в countryId / periodId / operatorId / mixId / tarifId / paymentId,
-        цепочки None и словарь options ради кодов не нужны.
+        фолбэк — если значение не является валидным id, а соответствующий *Code пуст,
+        значение резолвится КАК КОД. Поэтому код достаточно передать прямо в countryId /
+        periodId / operatorId / mixId / tarifId / paymentId, цепочки None и словарь options
+        ради кодов не нужны.
 
         rotationCode фолбэка не имеет вообще: он лишь проверяется на целое число и
         копируется в rotationId, так что пользуйтесь сразу rotationId (МИНУТЫ).
@@ -635,7 +1021,7 @@ class Api:
             raise TypeError('order options must be a dict')
         # generateAuth и алиасы uptime раньше в список не входили и молча терялись: первый
         # затирался значением setGenerateAuth() (по умолчанию 'N') в withGenerateAuth(), вторые
-        # исчезали вовсе, хотя @JsonAlias(["highAvailability", "isUptime"]) сервер их принимает.
+        # исчезали вовсе, хотя сервер принимает highAvailability и isUptime как алиасы uptime.
         allowed = (
             'countryId', 'countryCode', 'periodId', 'periodCode', 'paymentId', 'paymentCode',
             'mixId', 'mixCode', 'uptime', 'highAvailability', 'isUptime', 'protocol',
@@ -730,7 +1116,7 @@ class Api:
     @staticmethod
     def _assert_target_name(data):
         """
-        Повторяет проверку цели из client-api v1: для ipv4/ipv6/isp заказ без цели не
+        Повторяет серверную проверку цели: для ipv4/ipv6/isp заказ без цели не
         принимается. В v1 цель задавалась targetId+targetSectionId либо своим текстом,
         в v2 остался только customTargetName. Для mix проверка не нужна, если передан
         mixId/mixCode — иначе сервер резолвит тип в ipv4, и цель снова обязательна.
@@ -749,9 +1135,9 @@ class Api:
             value = data.get(key)
             return value is not None and str(value).strip() != ''
 
-        # Повторяет ClientApiService.parseMixSelection: сервер распознаёт mix не только по
-        # mixId/mixCode, но и через countryId — строкой "packageId:quantity" либо
-        # countryId=packageId вместе с quantity. Если mix распознан, цель не требуется.
+        # Сервер распознаёт mix-пакет не только по mixId/mixCode, но и через countryId —
+        # строкой "packageId:quantity" либо countryId=packageId вместе с quantity. Если mix
+        # распознан, цель не требуется.
         # Раньше проверялись только mixId/mixCode, и mix через countryId блокировался локально.
         if section in ('mix', 'mix_isp'):
             if filled('mixId') or filled('mixCode'):
@@ -771,36 +1157,6 @@ class Api:
         raise ValueError(
             'customTargetName is required for {} orders '
             '(client api returns "Incorrect goal", code 14)'.format(section))
-
-    #: Секции, которым X-Fingerprint ОБЯЗАТЕЛЕН: OrderService.createResidentOrder /
-    #: createScraperOrder без него отвечают "Header X-Fingerprint is required" и заказ не
-    #: создаётся. Прочие секции заголовок игнорируют.
-    FINGERPRINT_REQUIRED_SECTIONS = ('resident', 'scraper')
-
-    @classmethod
-    def _assert_fingerprint(cls, data, fingerprint):
-        """
-        Повторяет серверную проверку заголовка X-Fingerprint для резидентских и скраперных
-        заказов: заказ без него не создаётся вовсе, так что платить за отказ сетевым запросом
-        незачем — так же, как с целью заказа и с paymentId.
-
-        sectionCode нормализуем как сервер (регистр и '-'/' ' -> '_').
-
-        Raises:
-            ValueError: если секция требует заголовок, а значение не задано.
-        """
-        section = (data or {}).get('sectionCode')
-        section = '' if section is None else str(section).strip().lower().replace('-', '_').replace(' ', '_')
-        if section not in cls.FINGERPRINT_REQUIRED_SECTIONS:
-            return
-        if fingerprint is not None and str(fingerprint).strip() != '':
-            return
-        raise ValueError(
-            'X-Fingerprint is required for {} orders (client api answers "Header X-Fingerprint '
-            'is required" and creates nothing). Set a STABLE per-installation value: '
-            "Api({{'key': ..., 'fingerprint': '...'}}), setFingerprint(...) or "
-            'orderMake(data, fingerprint=...). Do not generate it per process — the header '
-            'feeds anti-fraud and affiliate attribution.'.format(section))
 
     def orderCalc(self, data):
         """
@@ -832,15 +1188,13 @@ class Api:
                 ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident | scraper.
                 Идентификаторы — ObjectId-СТРОКИ (в том числе orderId в ответе), и в каждом
                 *Id вместо ObjectId принимается код (см. orderCalc). rotationId — МИНУТЫ.
+                Платёжка ОБЯЗАТЕЛЬНА: paymentCode / paymentId — 'balance' либо
+                'paddle_subscription' (см. setPaymentCode).
             fingerprint (str): значение X-Fingerprint только для этого вызова; по умолчанию
-                берётся заданное конфигом или setFingerprint(). Заголовок объявлен
-                required на всей операции order/make, для resident и scraper он
-                действительно обязателен, остальные секции его игнорируют — поэтому
-                отправляем его для ЛЮБОЙ секции, как только значение известно.
-
-        Raises:
-            ValueError: если секция resident/scraper, а fingerprint не задан
-                (см. _assert_fingerprint).
+                берётся заданное конфигом или setFingerprint(). Заголовок необязателен для
+                любой секции: заданное значение уходит с запросом (анти-фрод и
+                affiliate-атрибуция), пустое или не заданное — не уходит, и заказ создаётся
+                так же.
 
         Returns:
             dict: The response from the endpoint.
@@ -848,7 +1202,6 @@ class Api:
         self._assert_target_name(data)
         value = fingerprint if fingerprint is not None else self.getFingerprint()
         value = '' if value is None else str(value).strip()
-        self._assert_fingerprint(data, value)
         options = {'headers': {'X-Fingerprint': value}} if value else {}
         return self.request('POST', 'order/make', json=data, **options)
 
@@ -1057,8 +1410,9 @@ class Api:
 
         tarifId — ObjectId резидентского тарифа ЛИБО его code.
 
-        Резидентский заказ БЕЗ X-Fingerprint сервер не создаёт вовсе, поэтому значение должно
-        быть задано конфигом/setFingerprint() либо передано сюда аргументом ``fingerprint``.
+        ``fingerprint`` — необязательное значение X-Fingerprint для этого вызова (по
+        умолчанию — из конфига или setFingerprint(), см. orderMake). Без него резидентский
+        заказ создаётся так же.
         """
         return self.orderMake(self.prepareResident(
             tarifId, coupon, self._order_options(options, order_options)), fingerprint)
@@ -1073,112 +1427,248 @@ class Api:
                 status_type ответа, а не человекочитаемый status), is_extend ('Y'/'N' —
                 только продления либо только первичные покупки), auto_order ('Y'/'N' — по
                 включённому автопродлению), page, limit, sort_by (date_insert | summ |
-                status), order (asc | desc). Все опциональны, имена snake_case, как в v1:
-                ту же ручку через обратное зеркало зовут клиенты легаси-API. Сервер их не
-                валидирует — неизвестное значение просто не применяется как фильтр.
+                status), order (asc | desc). Все опциональны. Фильтры запроса и поля ответа
+                order/list называются в snake_case (start_date, is_extend, …) — SDK передаёт
+                имена как есть. Сервер значения не валидирует — неизвестное значение просто
+                не применяется как фильтр.
 
         Returns:
-            dict: не плоский список, а пара ``metadata`` + ``items`` — форма v1.
+            dict: не плоский список, а пара ``metadata`` + ``items``.
                 ``metadata`` (total_orders, total_pages, current_page, current_limit) есть
                 всегда: без ``limit`` там total_pages = 1, current_limit = 0, а весь список
                 лежит в ``items``.
 
                 id, order_id, order_number, base_order_number и items[]['order_part_id'] —
-                СТРОКИ. id — легаси-число битрикса либо суррогат от base_order_number, наш
-                ObjectId лежит в order_id (тот же, что order_id в proxyList()). summ и
-                вложенные items[]['price'] — тоже строки, уже с валютой ('$25.00'),
-                auto_order / is_extend — 'Y'/'N', даты — ISO 8601 со смещением ('2026-09-01T14:15:26+00:00'), date_payed пуст, пока
-                заказ не оплачен.
+                СТРОКИ. id — числовой номер заказа, переданный строкой; ObjectId заказа лежит
+                в order_id — тот же, что order_id в proxyList(), и именно его принимают
+                prolongCalc() / prolongMake() для ipv6, mix и mix_isp. summ и вложенные
+                items[]['price'] — тоже строки, уже с валютой ('$25.00'), auto_order /
+                is_extend — 'Y'/'N', даты — ISO 8601 со смещением
+                ('2026-09-01T14:15:26+00:00'), date_payed пуст, пока заказ не оплачен.
         """
         params = self.filterNone(filters)
         return self.request('GET', 'order/list', params=params)
 
     # --------------------------- Prolong ---------------------------
 
-    @staticmethod
-    def _splitProlongTargets(ipsOrIds):
-        """
-        Разводит то, что пришло от вызывающего, на адреса и ObjectId.
+    #: Типы, которые продаются и продлеваются только ЦЕЛЫМ заказом. Их выбор — orderIds
+    #: (order_id из proxy/list или order/list): продлевается всё активное этого типа в
+    #: указанных заказах, у mix/mix_isp — mix-пакеты этих заказов. Остальные типы
+    #: (ipv4 / isp / mobile) продлеваются по отдельным прокси — ipIds (id из proxy/list)
+    #: либо ips (адреса).
+    PROLONG_ORDER_TYPES = ('ipv6', 'mix', 'mix_isp')
 
-        Клиенту удобнее продлевать по самим адресам — именно их он видит в proxy/list.
-        Сервер принимает их в поле ips и сам переводит в ids
-        (ClientApiService.resolveProlongIpsToIds — безусловно и для calc, и для make).
-        Адрес содержит точку или двоеточие (ipv4/isp/mix "ip", ipv6 "host:port" —
-        в поле "ip" уже лежат шлюз и порт, а в "ip_only" — один шлюз, mobile
-        "ip:port_http:port_socks"), ObjectId — 24 hex-символа без них, так что
-        смешанный список тоже работает.
+    #: Поля выбора "что продлить" у prolong/* и autoprolong/*. Пустой список не
+    #: отправляется: для сервера он ничем не отличается от отсутствующего поля.
+    PROLONG_SELECTION_FIELDS = ('ipIds', 'ips', 'orderIds')
+
+    #: Поля тела prolong/calc и prolong/make.
+    PROLONG_FIELDS = (
+        'ipIds', 'ips', 'orderIds', 'coupon', 'periodId', 'periodCode', 'paymentId',
+        'paymentCode')
+
+    #: Поля выбора, удалённые из контракта prolong/* и autoprolong/*. Сервер их больше не
+    #: читает, и запрос ушёл бы без выбора, поэтому переданные в dict-форме, в options или
+    #: именованными аргументами они отбиваются локально — с подсказкой, чем их заменить
+    #: (см. _assert_no_removed_prolong_fields). Позиционный параметр ids к ним не относится.
+    PROLONG_REMOVED_FIELDS = ('ids', 'orderSeparatorIds', 'orderSeparatorId')
+
+    @classmethod
+    def _assert_no_removed_prolong_fields(cls, values):
+        """
+        Удалённые из контракта поля выбора не выбрасываются молча: вызывающий, приславший
+        их, решил бы, что продлевает выбранное, а сервер получил бы тело без выбора.
+
+        Raises:
+            ValueError: если в values есть ids, orderSeparatorIds или orderSeparatorId —
+                с названием замены.
+        """
+        present = [key for key in cls.PROLONG_REMOVED_FIELDS if key in values]
+        if not present:
+            return
+        problems = []
+        if 'ids' in present:
+            problems.append(
+                'ids was removed: use ipIds (ipv4/isp/mobile) or orderIds (ipv6/mix/mix_isp), '
+                'or pass the selection as the second argument - the SDK routes it by type')
+        separators = [key for key in present if key != 'ids']
+        if separators:
+            problems.append(
+                '{} {} removed: use orderIds (order_id from proxy/list or order/list) - '
+                'mix/mix_isp are renewed as whole orders'.format(
+                    '/'.join(separators), 'were' if len(separators) > 1 else 'was'))
+        raise ValueError('; '.join(problems))
+
+    @staticmethod
+    def _prolongItems(value):
+        """
+        Элементы выбора списком: list / tuple / set как есть, строка — список через запятую,
+        одиночное значение — список из него. Строки обрезаются по краям, пустые строки и None
+        выбрасываются.
+        """
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = value.split(',')
+        elif not isinstance(value, (list, tuple, set, frozenset)):
+            value = [value]
+        items = []
+        for item in value:
+            if isinstance(item, str):
+                item = item.strip()
+                if not item:
+                    continue
+            elif item is None:
+                continue
+            items.append(item)
+        return items
+
+    @classmethod
+    def _splitProlongTargets(cls, targets, type=None):
+        """
+        Раскладывает "что продлить" по полям выбора — с учётом типа прокси из пути.
+
+        Значение с точкой или двоеточием — адрес, он уходит в ips: у ipv4/isp это поле ip из
+        proxy/list, у mobile — 'ip:port_http:port_socks'. Всё остальное — идентификатор: для
+        ipv6 / mix / mix_isp это order_id заказа (orderIds — эти типы продлеваются только
+        целым заказом), для остальных типов — id прокси (ipIds). Список, кортеж, множество
+        или строка через запятую; пустые элементы пропускаются.
+
+        Адрес для ipv6 / mix / mix_isp тоже уходит в ips, а не переосмысляется: сервер
+        отвечает на него понятной ошибкой "[ips] is not applicable for ipv6: prolong by
+        [orderIds]".
+
+        Returns:
+            dict: только непустые поля выбора — ips и/или ipIds либо orderIds.
         """
         ips, ids = [], []
-        if isinstance(ipsOrIds, str):
-            items = ipsOrIds.split(',')
-        elif isinstance(ipsOrIds, (list, tuple, set)):
-            items = list(ipsOrIds)
-        else:
-            return ips, ids
-        for item in items:
-            if not isinstance(item, str):
+        for item in cls._prolongItems(targets):
+            if isinstance(item, str) and ('.' in item or ':' in item):
+                ips.append(item)
+            else:
                 ids.append(item)
-                continue
-            value = item.strip()
-            if not value:
-                continue
-            (ips if ('.' in value or ':' in value) else ids).append(value)
-        return ips, ids
+        selection = {}
+        if ids:
+            by_order = cls._normalize_type(type) in cls.PROLONG_ORDER_TYPES
+            selection['orderIds' if by_order else 'ipIds'] = ids
+        if ips:
+            selection['ips'] = ips
+        return selection
 
-    def prepareProlong(self, ids=None, periodId=None, coupon='', options=None):
-        if isinstance(ids, dict):
-            payload = self.paymentOptions()
-            values = {**ids, **(options or {})}
-        else:
-            routed = {}
-            targetIps, targetIds = self._splitProlongTargets(ids)
-            if targetIps or targetIds:
-                # Пустой ids рядом с ips не ставим: сервер отдаёт приоритет ids.
-                if targetIds:
-                    routed['ids'] = targetIds
-                if targetIps:
-                    routed['ips'] = targetIps
-            elif ids is not None:
-                routed['ids'] = ids
-            payload = {
-                **self.paymentOptions(), **routed,
-                'periodId': periodId, 'coupon': coupon}
-            values = options or {}
+    def _prolongPayload(self, targets, type, defaults, values, fields, what,
+                        package_types=()):
+        """
+        Общая сборка тела prolong/* и autoprolong/*: платёжка клиента, выбор из targets
+        (_splitProlongTargets), значения по умолчанию и поля из белого списка fields —
+        переданные явно, они сильнее. Пустые поля выбора не отправляются.
+
+        Raises:
+            TypeError: если values не dict.
+            ValueError: если в values есть удалённые из контракта поля выбора
+                (_assert_no_removed_prolong_fields); для типов из package_types — если выбор
+                вообще передан; для ipv4 / isp / mobile — если в теле оказались сразу ipIds и
+                ips: при ipIds сервер ips не читает, и адреса выпали бы из продления молча.
+        """
         if not isinstance(values, dict):
-            raise TypeError('prolong options must be a dict')
-        for key in (
-                'ids', 'ips', 'orderSeparatorIds', 'orderSeparatorId', 'coupon',
-                'periodId', 'periodCode', 'paymentId', 'paymentCode'):
+            raise TypeError('{} options must be a dict'.format(what))
+        self._assert_no_removed_prolong_fields(values)
+        payload = {
+            **self.paymentOptions(), **self._splitProlongTargets(targets, type), **defaults}
+        for key in fields:
             if key in values:
                 payload[key] = values[key]
+        for key in self.PROLONG_SELECTION_FIELDS:
+            if key in payload:
+                items = self._prolongItems(payload.pop(key))
+                if items:
+                    payload[key] = items
+        normalized = self._normalize_type(type)
+        if normalized in package_types:
+            selected = [key for key in self.PROLONG_SELECTION_FIELDS if key in payload]
+            if selected:
+                raise ValueError(
+                    '{} for {} applies to the whole package and takes no proxy selection, '
+                    'drop {} (client api answers "[{}] is not applicable for {}: auto-prolong '
+                    'applies to the whole package")'.format(
+                        what, normalized, ' / '.join(selected), selected[0], normalized))
+        elif ('ipIds' in payload and 'ips' in payload
+                and normalized not in self.PROLONG_ORDER_TYPES):
+            raise ValueError(
+                'proxy ids and addresses cannot be combined{}: when ipIds is sent the server '
+                'ignores ips, so the addresses would be skipped silently. Pass either the ids '
+                'from proxy/list or the addresses.'.format(
+                    ' for ' + normalized if normalized else ''))
         return self.filterNone(
             self._resolveReferencePairs(payload, self.PROLONG_REFERENCE_PAIRS))
+
+    def prepareProlong(self, ids=None, periodId=None, coupon='', options=None, type=None):
+        """
+        Собрать тело prolong/calc и prolong/make.
+
+        Args:
+            ids: что продлить, см. prolongCalc(); раскладывается по полям выбора с учётом
+                type. dict вместо значения — тело целиком, поля выбора в нём уже проводные
+                (ipIds / ips / orderIds); удалённые ids / orderSeparatorIds /
+                orderSeparatorId в нём, как и в options, — ValueError.
+            periodId (str): ObjectId периода ЛИБО код периода ('1m').
+            coupon (str): Coupon code.
+            options (dict): остальные поля тела (PROLONG_FIELDS); переданные явно, они сильнее.
+            type (str): тип прокси из пути. Без него идентификаторы уходят в ipIds, как у
+                ipv4 / isp / mobile.
+        """
+        if isinstance(ids, dict):
+            return self._prolongPayload(
+                None, type, {}, {**ids, **(options or {})}, self.PROLONG_FIELDS, 'prolong')
+        return self._prolongPayload(
+            ids, type, {'periodId': periodId, 'coupon': coupon}, options or {},
+            self.PROLONG_FIELDS, 'prolong')
 
     def prolongCalc(self, type, ids=None, periodId=None, coupon='', options=None, **prolong_options):
         """
         Calculate the renewal.
 
         Args:
-            type (str): The type of the order - ipv4, ipv6, mobile, isp, mix or mix_isp.
-            ids (list): сами адреса, ровно в том виде, в каком их отдаёт proxy/list:
-                '1.2.3.4' (поле 'ip') для ipv4/isp/mix/mix_isp, '1.2.3.4:26000' (тоже поле
-                'ip': у ipv6 в нём уже лежат шлюз и порт, а в 'ip_only' — один шлюз),
-                'ip:port_http:port_socks' для mobile. ObjectId-строки принимаются
-                для любого типа, смешанный список работает — каждое значение
-                раскладывается по форме (_splitProlongTargets).
-            periodId (str): ObjectId периода ЛИБО код периода ('1m') — у prolong тот же
-                серверный фолбэк, что у order (normalizeProlongReferenceCodes), поэтому
-                periodCode передавать не обязательно.
+            type (str): The type of the order - ipv4, ipv6, mobile, isp, mix or mix_isp
+                (регистр и '-'/' ' не важны: 'MIX-ISP' == 'mix_isp').
+            ids (list): ЧТО продлить. Имя параметра сохранено ради совместимости позиционных
+                и именованных вызовов, но полем ``ids`` в тело оно не уходит — значения
+                раскладываются по типу (_splitProlongTargets):
+                    ipv4 / isp — адрес '1.2.3.4' (поле 'ip' из proxy/list) либо 'id' прокси;
+                    mobile — адрес 'ip:port_http:port_socks' (из полей ip, port_http и
+                        port_socks proxy/list) либо 'id' прокси;
+                    ipv6 / mix / mix_isp — 'order_id' заказа из proxy/list или order/list:
+                        эти типы продлеваются только ЦЕЛЫМ заказом — всё активное этого
+                        типа в заказе (у mix/mix_isp — mix-пакеты заказа).
+                Адреса уходят в ips, id прокси — в ipIds, id заказов — в orderIds. Список
+                либо строка через запятую. Адреса и id прокси в одном вызове не смешиваются:
+                при ipIds сервер ips не читает, поэтому такая смесь отбивается локально.
+            periodId (str): ObjectId периода ЛИБО код периода ('1m') — сервер резолвит код
+                прямо в этом поле, periodCode передавать не обязательно.
             coupon (str): Coupon code.
             options: paymentId (ObjectId ЛИБО код платёжной системы, например 'balance'),
-                orderSeparatorId / orderSeparatorIds, ids.
+                paymentCode, periodCode, а также поля выбора в проводном виде — ipIds, ips,
+                orderIds (явное значение сильнее разложенного из ids). Пустые списки не
+                отправляются. Удалённые из контракта ids, orderSeparatorIds и
+                orderSeparatorId здесь (как и в dict-форме) — ValueError с подсказкой
+                замены; позиционного параметра ids это не касается.
+
+        Raises:
+            ValueError: если для ipv4 / isp / mobile вместе переданы id прокси и адреса, или
+                если в options / dict-форме есть ids, orderSeparatorIds либо
+                orderSeparatorId (замена — ipIds / orderIds).
+            ApiError: поле выбора не того вида для типа — "[orderIds] is not applicable for
+                ipv4: prolong by [ipIds]", "[ips] is not applicable for ipv6: prolong by
+                [orderIds]"; code 29 "Incorrect orderIds" — заказ чужой, без активных прокси
+                этого типа, или список пуст: запрос отбивается целиком.
 
         Returns:
-            dict: The response from the endpoint.
+            dict: warning, balance, total, quantity, currency, discount, orders, items[].
+                quantity и items показывают, что продлевается на самом деле: у ipv6 / mix /
+                mix_isp — все активные прокси выбранных заказов.
         """
         values = self._order_options(options, prolong_options)
         return self.request('POST', 'prolong/calc/' + type,
-                            json=self.prepareProlong(ids, periodId, coupon, values))
+                            json=self.prepareProlong(ids, periodId, coupon, values, type))
 
     def prolongMake(self, type, ids=None, periodId=None, coupon='', options=None, **prolong_options):
         """
@@ -1186,20 +1676,28 @@ class Api:
 
         Args:
             type (str): The type of the order - ipv4, ipv6, mobile, isp, mix or mix_isp.
-            ids (list): сами адреса из proxy/list ЛИБО ObjectId-строки, см. prolongCalc().
+            ids (list): что продлить — адреса либо id прокси для ipv4 / isp / mobile,
+                order_id заказов для ipv6 / mix / mix_isp; см. prolongCalc(). Имя параметра
+                сохранено ради совместимости.
             periodId (str): ObjectId периода ЛИБО код периода ('1m'), см. prolongCalc().
             coupon (str): Coupon code.
-            options: paymentId (ObjectId ЛИБО код платёжной системы), orderSeparatorId /
-                orderSeparatorIds, ids.
+            options: paymentId (ObjectId ЛИБО код платёжной системы), ipIds / ips / orderIds —
+                как в prolongCalc().
 
         Returns:
-            dict: {'orderId': ObjectId-строка, 'total', 'balance', 'listBaseOrderNumbers'}.
+            dict: {'orderId', 'orderIds', 'total', 'listBaseOrderNumbers', 'balance'}.
+                orderIds — ВСЕ продлённые заказы (order_id из proxy/list и order/list, без
+                повторов: одним запросом продлевается несколько заказов), orderId — первый
+                из них, оставлен для совместимости. listBaseOrderNumbers — базовые номера
+                продлённых заказов, по одному на заказ (у mix/mix_isp — на пакет), как
+                base_order_number в order/list.
 
         Raises:
+            ValueError: как в prolongCalc().
             ApiError: при нехватке средств — продление НЕ состоялось. Причина приходит в
-                errors[{code: 16, message: "Insufficient funds on balance"}]
-                (ProlongMakeResponseClientDto.ofInsufficientFunds), а calc-данные с дословным
-                warning остаются в конверте — ``error.body['data']``.
+                errors[{code: 16, message: "Insufficient funds on balance"}], а calc-данные с
+                дословным warning остаются в конверте — ``error.body['data']``. Ошибки
+                выбора — как в prolongCalc().
         """
         values = self._order_options(options, prolong_options)
         # Прежняя обёртка _assert_prolong_made здесь УБРАНА. Она писалась под старую форму
@@ -1208,16 +1706,17 @@ class Api:
         # эффектом было превращать ЛЕГИТИМНЫЙ "status: success" с пустым orderId в фальшивую
         # ошибку — уже ПОСЛЕ списания денег, потеряв total/balance/listBaseOrderNumbers.
         return self.request('POST', 'prolong/make/' + type,
-                            json=self.prepareProlong(ids, periodId, coupon, values))
+                            json=self.prepareProlong(ids, periodId, coupon, values, type))
 
     # --------------------------- Auto prolong ---------------------------
 
-    #: Поля тела autoprolong/* — унаследованный ProlongRequest плюс subscriptionId и tarifId.
-    #: Snake-написания сервер тоже принимает (AutoProlongRequestClientDto.applyAliases), но
-    #: приоритет там у camelCase, поэтому SDK шлёт каноническую форму; присланные вызывающим
-    #: алиасы просто пропускаем дальше, мешать им незачем.
+    #: Поля тела autoprolong/* — поля выбора и оплаты prolong/* (без купона) плюс
+    #: subscriptionId и tarifId. Snake-написания сервер тоже принимает, но приоритет у
+    #: camelCase, поэтому SDK шлёт каноническую форму; присланные вызывающим алиасы просто
+    #: пропускаем дальше, мешать им незачем. Удалённые из контракта ids, orderSeparatorIds и
+    #: orderSeparatorId отбиваются ValueError, как и у prolong/* (PROLONG_REMOVED_FIELDS).
     AUTO_PROLONG_FIELDS = (
-        'ids', 'ips', 'orderSeparatorIds', 'orderSeparatorId', 'periodId', 'periodCode',
+        'ipIds', 'ips', 'orderIds', 'periodId', 'periodCode',
         'paymentId', 'paymentCode', 'subscriptionId', 'tarifId',
         'payment_id', 'subscription_id', 'tarif_id', 'tariffId')
 
@@ -1226,43 +1725,42 @@ class Api:
     #: available".
     AUTO_PROLONG_UNSUPPORTED_TYPES = ('scraper',)
 
+    #: Типы, у которых автопродление адресуется всем пакетом: полей выбора в теле нет, а
+    #: присланные сервер отбивает ("[ipIds] is not applicable for resident: auto-prolong
+    #: applies to the whole package").
+    AUTO_PROLONG_PACKAGE_TYPES = ('resident',)
+
     #: Платёжки, которые автопродление принимает. Разовый чекаут Paddle требует редиректа в
     #: браузер, которого у headless-клиента нет, поэтому он сюда не входит.
     AUTO_PROLONG_PAYMENT_CODES = ('balance', 'paddle_subscription')
 
-    def prepareAutoProlong(self, ids=None, periodId=None, options=None):
+    def prepareAutoProlong(self, ids=None, periodId=None, options=None, type=None):
         """
-        Собрать тело autoprolong/*: тот же выбор прокси, что у prolong/* (ids/ips/
-        orderSeparatorIds, periodId/periodCode, paymentId/paymentCode), плюс subscriptionId
-        и tarifId.
+        Собрать тело autoprolong/*: тот же выбор, что у prolong/* (та же раскладка по типу —
+        _splitProlongTargets), periodId/periodCode, paymentId/paymentCode, плюс
+        subscriptionId и tarifId.
 
-        Купон СОЗНАТЕЛЬНО не отправляется, хотя поле унаследовано от ProlongRequest:
+        Для type=resident выбора нет вовсе: единица правки — весь пакет, и тело состоит из
+        платёжки (и, по желанию, tarifId).
+
+        Купон СОЗНАТЕЛЬНО не отправляется, хотя тело autoprolong/* повторяет тело prolong/*:
         автопродление промокод не применяет нигде, и превью со скидкой врало бы ровно про ту
         сумму, ради которой ручку и зовут.
+
+        Raises:
+            ValueError: для type=resident с непустым выбором — сервер такой запрос отбивает, а
+                молча выбросить выбор нельзя: клиент решил бы, что правит отдельные адреса,
+                хотя правится весь пакет. Для ipv4 / isp / mobile — если вместе переданы id
+                прокси и адреса. Для любого типа — если в options / dict-форме есть удалённые
+                ids, orderSeparatorIds или orderSeparatorId (см. _prolongPayload).
         """
         if isinstance(ids, dict):
-            payload = self.paymentOptions()
-            values = {**ids, **(options or {})}
-        else:
-            routed = {}
-            targetIps, targetIds = self._splitProlongTargets(ids)
-            if targetIps or targetIds:
-                # Пустой ids рядом с ips не ставим: сервер отдаёт приоритет ids.
-                if targetIds:
-                    routed['ids'] = targetIds
-                if targetIps:
-                    routed['ips'] = targetIps
-            elif ids is not None:
-                routed['ids'] = ids
-            payload = {**self.paymentOptions(), **routed, 'periodId': periodId}
-            values = options or {}
-        if not isinstance(values, dict):
-            raise TypeError('autoprolong options must be a dict')
-        for key in self.AUTO_PROLONG_FIELDS:
-            if key in values:
-                payload[key] = values[key]
-        return self.filterNone(
-            self._resolveReferencePairs(payload, self.PROLONG_REFERENCE_PAIRS))
+            return self._prolongPayload(
+                None, type, {}, {**ids, **(options or {})}, self.AUTO_PROLONG_FIELDS,
+                'autoprolong', self.AUTO_PROLONG_PACKAGE_TYPES)
+        return self._prolongPayload(
+            ids, type, {'periodId': periodId}, options or {}, self.AUTO_PROLONG_FIELDS,
+            'autoprolong', self.AUTO_PROLONG_PACKAGE_TYPES)
 
     @classmethod
     def _assert_auto_prolong_type(cls, type):
@@ -1273,7 +1771,7 @@ class Api:
         Raises:
             ValueError: для type=scraper.
         """
-        normalized = '' if type is None else str(type).strip().lower().replace('-', '_').replace(' ', '_')
+        normalized = cls._normalize_type(type)
         if normalized in cls.AUTO_PROLONG_UNSUPPORTED_TYPES:
             raise ValueError(
                 'autoprolong is not available for {}: client api answers "Create new order to '
@@ -1326,31 +1824,36 @@ class Api:
         Args:
             type (str): ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident. Для scraper
                 автопродления нет (см. _assert_auto_prolong_type).
-            ids (list): сами адреса из proxy/list ЛИБО ObjectId-строки — как в prolongCalc().
-                Для type=resident выбор не нужен: единица правки — весь пакет.
+            ids (list): что поставить на автопродление — как в prolongCalc(): адрес либо id
+                прокси для ipv4 / isp / mobile, order_id заказа для ipv6 / mix / mix_isp
+                (такие заказы автопродлеваются целиком). Имя параметра сохранено ради
+                совместимости. Для type=resident выбор не передаётся: единица правки — весь
+                пакет (переданный выбор — ValueError).
             periodId (str): ObjectId периода ЛИБО код периода ('1m'). Обязателен для обычных
                 прокси ("Set existed [periodId] from reference"), у резидентки периода нет.
             options: paymentId (ОБЯЗАТЕЛЕН, balance либо paddle_subscription),
                 subscriptionId (при paddle_subscription), tarifId (только resident —
                 подтверждение тарифа самого пакета, сменить тариф автопродление не умеет),
-                orderSeparatorId / orderSeparatorIds, ips, ids.
+                поля выбора в проводном виде — ipIds, ips, orderIds.
 
         Returns:
             dict: warning, balance, total, quantity, currency, discount, orders, items[],
-                days (null у резидентки), tarifId (только резидентка), chargeDate
+                days (у резидентки — период тарифа), tarifId (только резидентка), chargeDate
                 (null у резидентки — пакет продлевается по дате ОКОНЧАНИЯ ЛИБО по исчерпанию
                 трафика), dateEnd, paymentId, autoProlong. Даты — строки "yyyy-MM-dd HH:mm:ss".
 
                 НЕХВАТКА БАЛАНСА — это НЕ исключение: конверт приходит со status="error", но с
-                ЗАПОЛНЕННЫМ data и ПУСТЫМ errors[] (ofWarning, та же форма, что у
-                prolong/calc), поэтому метод возвращает данные, а warning объясняет разницу.
+                ЗАПОЛНЕННЫМ data и ПУСТЫМ errors[] (та же форма, что у prolong/calc), поэтому
+                метод возвращает данные, а warning объясняет разницу.
 
         Raises:
-            ValueError: для type=scraper и при незаданной/неподдерживаемой платёжке.
+            ValueError: для type=scraper, при незаданной/неподдерживаемой платёжке, при
+                выборе для resident, при смеси id прокси и адресов и при удалённых ids /
+                orderSeparatorIds / orderSeparatorId в options (замена — ipIds / orderIds).
         """
         self._assert_auto_prolong_type(type)
         values = self._order_options(options, autoprolong_options)
-        payload = self.prepareAutoProlong(ids, periodId, values)
+        payload = self.prepareAutoProlong(ids, periodId, values, type)
         self._assert_auto_prolong_payment(payload)
         return self.request('POST', 'autoprolong/calc/' + type, json=payload)
 
@@ -1363,23 +1866,26 @@ class Api:
 
         Args:
             type (str): как в autoProlongCalc(). Для resident тело пакетное — достаточно
-                paymentId (и опционально tarifId), ids/ips/periodId там не нужны.
-            ids (list): адреса из proxy/list ЛИБО ObjectId-строки.
+                paymentId (и опционально tarifId), выбор и periodId там не нужны.
+            ids (list): что включить — как в autoProlongCalc(): адреса либо id прокси, для
+                ipv6 / mix / mix_isp — order_id заказов.
             periodId (str): период, который будет покупаться при каждом продлении.
-            options: paymentId (ОБЯЗАТЕЛЕН), subscriptionId, tarifId, orderSeparatorIds, …
+            options: paymentId (ОБЯЗАТЕЛЕН), subscriptionId, tarifId, ipIds / ips / orderIds, …
 
         Returns:
-            dict: warning, autoProlong, quantity, ids[], days, paymentId, chargeDate, dateEnd.
-                quantity и ids — это то, что РЕАЛЬНО затронуто, а не эхо запроса: у ipv6
-                автопродление включается целым заказом, поэтому один адрес включает все;
-                у резидентки quantity=1 и пустой ids.
+            dict: warning, autoProlong, quantity, ipIds[], orderIds[], days, paymentId,
+                chargeDate, dateEnd. quantity, ipIds (id затронутых прокси) и orderIds (их
+                заказы) — то, что РЕАЛЬНО затронуто, а не эхо запроса: у ipv6 / mix / mix_isp
+                автопродление включается на все активные прокси присланных заказов. У
+                резидентки quantity=1, а ipIds и orderIds пусты. Прежнее поле ответа ids
+                переименовано в ipIds.
 
         Raises:
-            ValueError: для type=scraper и при незаданной/неподдерживаемой платёжке.
+            ValueError: как в autoProlongCalc().
         """
         self._assert_auto_prolong_type(type)
         values = self._order_options(options, autoprolong_options)
-        payload = self.prepareAutoProlong(ids, periodId, values)
+        payload = self.prepareAutoProlong(ids, periodId, values, type)
         self._assert_auto_prolong_payment(payload)
         return self.request('POST', 'autoprolong/enable/' + type, json=payload)
 
@@ -1393,21 +1899,23 @@ class Api:
         Args:
             type (str): как в autoProlongCalc(). Для resident тело не нужно вовсе — пакет
                 адресуется по apiKey.
-            ids (list): адреса из proxy/list ЛИБО ObjectId-строки.
-            options: orderSeparatorId / orderSeparatorIds, ips, ids. Ни periodId, ни paymentId
-                здесь не требуются.
+            ids (list): что выключить — как в autoProlongCalc(): адреса либо id прокси, для
+                ipv6 / mix / mix_isp — order_id заказов.
+            options: ipIds / ips / orderIds. Ни periodId, ни paymentId здесь не требуются.
 
         Returns:
-            dict: warning, autoProlong, quantity, ids[], dateEnd, а days / paymentId /
-                chargeDate — null: выключение их и очищает.
+            dict: warning, autoProlong, quantity, ipIds[], orderIds[], dateEnd, а paymentId и
+                chargeDate — null: выключение их и очищает. days у обычных прокси тоже null,
+                у резидентки — период тарифа (тариф на пакете остаётся).
 
         Raises:
-            ValueError: для type=scraper.
+            ValueError: для type=scraper, при выборе для resident, при смеси id прокси и
+                адресов и при удалённых ids / orderSeparatorIds / orderSeparatorId в options.
         """
         self._assert_auto_prolong_type(type)
         values = self._order_options(options, autoprolong_options)
         return self.request('POST', 'autoprolong/disable/' + type,
-                            json=self.prepareAutoProlong(ids, None, values))
+                            json=self.prepareAutoProlong(ids, None, values, type))
 
     # --------------------------- Proxy ---------------------------
 
@@ -1470,9 +1978,9 @@ class Api:
         """
         Export the resident proxy list (файл, attachment).
 
-        Литеральный маршрут proxy/download/resident обслуживает ResidentUserController, он
-        специфичнее шаблона {type} и перехватывает запрос на себя. Имя параметра листа там —
-        listId, ``id`` оставлен алиасом, поэтому отправляем именно его.
+        Литеральный маршрут proxy/download/resident — отдельная ручка основного
+        резидентского пакета, она специфичнее шаблона proxy/download/{type}. Лист в ней
+        задаётся параметром listId либо его алиасом ``id`` — SDK отправляет ``id``.
 
         Args:
             id (str): List id. Идентификаторы резидентских листов ЧИСЛОВЫЕ (Long),
@@ -1486,7 +1994,7 @@ class Api:
         return self.request('GET', 'proxy/download/resident', params=self.filterNone(
             {'id': id, 'ext': self.assertExt(ext), 'maxLine': maxLine}))
 
-    #: Допустимые значения type у proxy/replace — ПРИЧИНА замены (enum ProxyReplaceType).
+    #: Допустимые значения type у proxy/replace — ПРИЧИНА замены.
     PROXY_REPLACE_TYPES = (
         'NOT_WORK', 'INCORRECT_LOCATION', 'CANT_CHANGE_NETWORK', 'LOW_SPEED', 'CUSTOM')
 
@@ -1497,7 +2005,7 @@ class Api:
         Args:
             ids (list): Ids of the IP addresses to replace (ObjectId-строки). Одиночный id
                 тоже принимается.
-            type (str): ПРИЧИНА замены, а не тип прокси. Enum ProxyReplaceType:
+            type (str): ПРИЧИНА замены, а не тип прокси. Одно из:
                 NOT_WORK | INCORRECT_LOCATION | CANT_CHANGE_NETWORK | LOW_SPEED | CUSTOM.
                 Сервер сам приводит значение к верхнему регистру. Обязателен: без него
                 ответ — "Set coorect type: ..." (опечатка серверная).
@@ -1552,7 +2060,7 @@ class Api:
         """
         Package Information. Remaining traffic, end date.
 
-        Ключи ответа — snake_case, а НЕ camelCase (схема ResidentPackage в openapi.yaml).
+        Ключи ответа — snake_case, а НЕ camelCase.
         Единственное имя, совпадающее в обоих написаниях, — ``rotation``.
 
         Returns:
@@ -1588,10 +2096,9 @@ class Api:
 
         Returns:
             dict | list: обычно объект, СГРУППИРОВАННЫЙ по логину листа и времени. Но при
-                пустом периоде сервер отдаёт ПУСТОЙ СПИСОК ``[]``, а не ``{}`` — байт-в-байт
-                как v1, где пустой ассоциативный массив PHP сериализуется в ``[]``. Код,
-                идущий по ключам или ``.items()``, на этом штатном ответе упадёт: проверяйте
-                результат перед разбором.
+                пустом периоде сервер отдаёт ПУСТОЙ СПИСОК ``[]``, а не ``{}``. Код, идущий по
+                ключам или ``.items()``, на этом штатном ответе упадёт: проверяйте результат
+                перед разбором.
         """
         return self.request('POST', 'resident/traffic/details', json=filter or {})
 
@@ -1659,14 +2166,14 @@ class Api:
             export (dict): {'ports': int, 'ext': str}.
 
         Raises:
-            ValueError: если в dict-форме ``geo`` не объект. Сервер ждёт объект GeoDto
-                (country/region/city/isp); массив Jackson не свяжет. Пустой geo допустим —
+            ValueError: если в dict-форме ``geo`` не объект. Сервер ждёт объект
+                (country/region/city/isp), массив он отклоняет. Пустой geo допустим —
                 значит "без гео-фильтра". Раньше geo=[] падал AttributeError.
 
         Returns:
             dict: Created list model, ``id`` — число. В ОТВЕТЕ ``geo`` — МАССИВ
-                (``geo[0].country``), пустой при листе без гео-фильтра; объектом GeoDto
-                оно бывает только в ЗАПРОСЕ. ``geo['country']`` даст TypeError.
+                (``geo[0].country``), пустой при листе без гео-фильтра; объектом оно бывает
+                только в ЗАПРОСЕ. ``geo['country']`` даст TypeError.
         """
         if isinstance(title, dict):
             data = dict(title)
@@ -1831,8 +2338,8 @@ class Api:
             title (str): List title.
             whitelist (str): Comma separated ip list.
             country/region/city/isp (str): гео по частям.
-            geo (dict): гео целиком — ОБЪЕКТ {country, region, city, isp}; сервер объявляет
-                поле @NotNull, поэтому пустой объект отправляется всегда.
+            geo (dict): гео целиком — ОБЪЕКТ {country, region, city, isp}; поле для сервера
+                обязательное, поэтому пустой объект отправляется всегда.
             rotation (int): -1 sticky, 0 per request, 1-3600 seconds.
             export (dict): {'ports': int, 'ext': str}.
 
