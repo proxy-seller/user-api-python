@@ -1925,9 +1925,16 @@ class Api:
             type (str): ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident | None.
                 Без типа ответ — словарь с ключами ipv4, ipv6, mobile, isp, mix, mix_isp,
                 resident.
-            filters: latest ("Y" — последний заказ), orderId (ObjectId-СТРОКА, не число),
-                country (код страны), ends, page, per_page (пагинация работает только для
-                запроса с типом).
+            filters: latest, orderId, country (код страны), ends, page, per_page (пагинация
+                работает только для запроса с типом).
+                latest="Y" — только прокси последнего заказа среди тех, что вернул бы запрос:
+                с типом — последнего заказа этого типа (mix / mix_isp — последнего MIX), без
+                типа — один последний заказ на весь ответ. «Последний» — по покупке, продление
+                не в счёт. С orderId игнорируется, на resident и scraper не действует.
+                orderId — любой идентификатор заказа из ответов API: order_id (proxyList /
+                orderList), числовой id строки orderList (id строки продления — её заказ) или
+                номер: текущий order_number, base_order_number либо прежний номер продлённого
+                заказа (_e_<hash>).
 
         Returns:
             dict: The list of proxies.

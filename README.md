@@ -502,7 +502,18 @@ api.proxyCommentSet(['IP_ID'], 'main pool')
 ```
 
 `proxyList()` without a type returns a dict keyed by `ipv4`, `ipv6`, `mobile`, `isp`, `mix`,
-`mix_isp`, `resident`. The `orderId` filter is an ObjectId string.
+`mix_isp`, `resident`.
+
+- `latest='Y'` returns only the proxies of the latest order among those the request returns:
+  with a type, the latest order of that type (`mix` / `mix_isp` — the latest MIX order); without
+  a type, one latest order for the whole response, so the other sections come back empty. The
+  latest order is the last one bought — a renewal does not count. It is ignored when `orderId`
+  is set and has no effect on `resident` and `scraper`.
+- `orderId` takes any order identifier the API returns: `order_id` (from `proxyList()` or
+  `orderList()`), the numeric `id` of an `orderList()` row (a renewal row selects the order it
+  renews), or the order number — the current `order_number`, `base_order_number`, or an earlier
+  number of a renewed order with an older `_e_<hash>` suffix. An unknown order or one of another
+  account returns empty lists.
 
 `proxyReplace(ids, type, comment)` — **`type` is the replacement reason, not a proxy type**:
 `NOT_WORK`, `INCORRECT_LOCATION`, `CANT_CHANGE_NETWORK`, `LOW_SPEED`, `CUSTOM`. It is
