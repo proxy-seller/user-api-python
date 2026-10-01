@@ -825,6 +825,26 @@ class AutoProlongSelectionTest(unittest.TestCase):
                             options={'ids': []})
         self.assertEqual(session.last['json'], {'paymentId': 'balance'})
 
+    def test_paddle_subscription_needs_no_subscription_id_locally(self):
+        """
+        paddle_subscription без subscriptionId уходит на сервер: с одной привязанной картой он
+        берёт её сам, а сколько карт на аккаунте, знает только он. Заданный subscriptionId
+        отправляется как есть.
+        """
+        api, session = make_api([envelope({'total': 1}), envelope({'autoProlong': True}),
+                                 envelope({'autoProlong': True}), envelope({'autoProlong': True})])
+        api.autoProlongCalc('ipv4', [self.PROXY_ID], '1m', paymentId='paddle_subscription')
+        self.assertEqual(session.last['json'], {
+            'ids': [self.PROXY_ID], 'periodId': '1m', 'paymentId': 'paddle_subscription'})
+        api.autoProlongEnable('resident', paymentId='paddle_subscription')
+        self.assertEqual(session.last['json'], {'paymentId': 'paddle_subscription'})
+        api.setPaymentCode('paddle_subscription')
+        api.autoProlongEnable('ipv6', [self.ORDER_ID], '1m')
+        self.assertEqual(session.last['json'], {
+            'orderIds': [self.ORDER_ID], 'periodId': '1m', 'paymentCode': 'paddle_subscription'})
+        api.autoProlongEnable('mix', [self.ORDER_ID], '1m', subscriptionId='sub_1')
+        self.assertEqual(session.last['json']['subscriptionId'], 'sub_1')
+
     def test_resident_with_selection_is_rejected_locally(self):
         """
         Любой выбор у resident — ids, ips или orderIds — сервер отбивает одним текстом

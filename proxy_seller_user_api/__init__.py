@@ -1782,12 +1782,12 @@ class Api:
         догадкой за него. Без поля сервер отвечает "Set [paymentId]".
 
         Какой ТИП платёжки стоит за ObjectId, знает только сервер, поэтому здесь проверяется
-        наличие значения; а если код прислан дословно, то ещё и то, что он из разрешённой пары
-        и что у paddle_subscription есть парный subscriptionId ("Set [subscriptionId]").
+        наличие значения; а если код прислан дословно, то ещё и то, что он из разрешённой пары.
+        subscriptionId не спрашиваем: с одной привязанной картой сервер берёт её сам, а сколько
+        карт на аккаунте, видно только ему ("Set [subscriptionId]", если их несколько).
 
         Raises:
-            ValueError: если платёжка не задана, задана неподдерживаемым кодом или подписка
-                Paddle выбрана без subscriptionId.
+            ValueError: если платёжка не задана или задана неподдерживаемым кодом.
         """
         payment = payload.get('paymentId') or payload.get('paymentCode') or payload.get('payment_id')
         payment = '' if payment is None else str(payment).strip()
@@ -1805,13 +1805,6 @@ class Api:
                     'autoprolong accepts only {} ({!r} is a one-off checkout and needs a '
                     'browser redirect).'.format(
                         ' / '.join(cls.AUTO_PROLONG_PAYMENT_CODES), payment))
-            return
-        if payment.lower() == 'paddle_subscription':
-            subscription = (payload.get('subscriptionId') or payload.get('subscription_id') or '')
-            if str(subscription).strip() == '':
-                raise ValueError(
-                    'subscriptionId is required when paying autoprolong with '
-                    'paddle_subscription (client api answers "Set [subscriptionId]")')
 
     def autoProlongCalc(self, type, ids=None, periodId=None, options=None, **autoprolong_options):
         """
@@ -1828,7 +1821,8 @@ class Api:
             periodId (str): ObjectId периода ЛИБО код периода ('1m'). Обязателен для обычных
                 прокси ("Set existed [periodId] from reference"), у резидентки периода нет.
             options: paymentId (ОБЯЗАТЕЛЕН, balance либо paddle_subscription),
-                subscriptionId (при paddle_subscription), tarifId (только resident —
+                subscriptionId (при paddle_subscription, если привязанных карт несколько;
+                единственную карту сервер берёт сам), tarifId (только resident —
                 подтверждение тарифа самого пакета, сменить тариф автопродление не умеет),
                 поля выбора в проводном виде — ids, ips, orderIds.
 

@@ -418,8 +418,10 @@ and `mix_isp`.
 
 `paymentId` is **mandatory** for `calc` and `enable` — the charge happens while you are away, so
 the payment system cannot be guessed. Only `balance` and `paddle_subscription` are accepted: a
-one-off Paddle checkout needs a browser redirect a headless client cannot complete. With
-`paddle_subscription` also pass `subscriptionId`.
+one-off Paddle checkout needs a browser redirect a headless client cannot complete.
+`paddle_subscription` charges the card saved on the account: pass `subscriptionId` only when the
+account has several saved cards (the server answers `Set [subscriptionId]`), with one card it is
+picked automatically.
 
 Residential packages renew as a package, not as addresses — send no selection:
 
