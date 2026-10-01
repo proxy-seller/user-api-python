@@ -38,6 +38,10 @@ class ApiError(Exception):
     поэтому по errors[0] нельзя отличить битый ключ от неразрешённого IP и от превышения
     лимита запросов.
     Полный массив доступен в ``errors``.
+
+    API-ключ стоит в пути URL, поэтому Api заменяет его на ``***`` во всём, что кладёт в
+    ошибку: в тексте, ``body``, ``errors``, ``custom_data`` и в ``__cause__`` транспортной
+    ошибки (копия исключения requests того же класса — без request/response).
     """
 
     def __init__(self, message, code=None, custom_data=None, http_status=None, body=None,
@@ -396,13 +400,34 @@ class Api:
         'residentsubuser/list/tools': RateLimiter.WRITE,
     }
 
+    #: Таймаут money-вызовов (order/make, prolong/make/{type}, balance/add) по умолчанию,
+    #: секунды. Большой заказ (MIX на десятки стран) создаётся дольше 30 секунд общего
+    #: таймаута: оборванный по таймауту ОПЛАЧЕННЫЙ заказ выглядел ошибкой, а повтор создавал
+    #: второй.
+    DEFAULT_MONEY_TIMEOUT = 120
+
+    #: Чем API-ключ заменяется во всём, что SDK отдаёт наружу в ApiError.
+    REDACTED = '***'
+
+    #: Сколько символов тела без конверта остаётся в ApiError.body у money/write (см. request()).
+    UNEXPECTED_BODY_LIMIT = 500
+
     def __init__(self, config):
         """
         API key placed in https://proxy-seller.com/personal/api/.
 
         Args:
-            config (dict): Configuration options: key (required), base_url, timeout, headers,
-                request_options, session, fingerprint, rate_limit.
+            config (dict): Configuration options: key (required), base_url, timeout,
+                money_timeout, headers, request_options, session, fingerprint, rate_limit.
+
+                timeout — таймаут HTTP-запроса в секундах (то, что принимает requests:
+                число, пара (connect, read) или None — без ограничения), по умолчанию 30.
+
+                money_timeout (или moneyTimeout) — таймаут money-вызовов: order/make,
+                prolong/make/{type}, balance/add; по умолчанию DEFAULT_MONEY_TIMEOUT (120 с),
+                None — без ограничения. Money-вызов ждёт дольше из timeout и money_timeout;
+                у пары (connect, read) удлиняется только read. Таймаут, явно переданный в
+                request(), берётся как есть.
 
                 rate_limit — очередь запросов, ВКЛЮЧЕНА по умолчанию (см. RateLimiter):
                 dict с опциями enabled [True], requests_per_minute [1000],
@@ -411,8 +436,8 @@ class Api:
                 поведение без ожиданий и повторов.
 
         Raises:
-            ValueError: без key или при неверной опции rate_limit (неизвестное имя,
-                недопустимое значение).
+            ValueError: без key, при неверной опции rate_limit (неизвестное имя,
+                недопустимое значение) или money_timeout (не положительное число и не None).
             TypeError: если rate_limit не dict и не True/False.
         """
 
@@ -425,8 +450,14 @@ class Api:
         self.rate_limiter = RateLimiter._from_config(
             config['rate_limit'] if 'rate_limit' in config else config.get('rateLimit'))
         api_root = config.get('base_url') or config.get('baseUrl') or config.get('baseURL') or self.URL
-        self.base_uri = str(api_root).rstrip('/') + '/' + quote(str(config['key']), safe='') + '/'
+        key = str(config['key'])
+        self.base_uri = str(api_root).rstrip('/') + '/' + quote(key, safe='') + '/'
+        # Ключ стоит в пути URL, а путь попадает в тексты транспортных ошибок requests и в эхо
+        # ответов (фронт-404 стейджа отдаёт путь в нижнем регистре). Всё, что request() отдаёт
+        # наружу в ApiError, проходит через _redact().
+        self._key_patterns = self._secret_patterns(key)
         self.timeout = config.get('timeout', 30)
+        self.money_timeout = self._money_timeout_option(config)
         self.headers = {'Content-Type': 'application/json', **config.get('headers', {})}
         self.request_options = dict(config.get('request_options', {}))
         self.session = config.get('session') or requests.Session()
@@ -436,6 +467,133 @@ class Api:
         # X-Fingerprint можно задать и прямо в headers — тогда он уйдёт со всеми запросами;
         # подхватываем это значение, чтобы getFingerprint() видел уже настроенный заголовок.
         self.fingerprint = config.get('fingerprint') or self.headers.get('X-Fingerprint')
+
+    @classmethod
+    def _money_timeout_option(cls, config):
+        """
+        Опция money_timeout (или moneyTimeout) конфига: положительное число секунд либо None —
+        без ограничения, как у timeout. Не задана — DEFAULT_MONEY_TIMEOUT.
+
+        Raises:
+            ValueError: оба написания сразу или недопустимое значение.
+        """
+        if 'money_timeout' in config and 'moneyTimeout' in config:
+            raise ValueError('pass either money_timeout or moneyTimeout, not both')
+        value = config['money_timeout'] if 'money_timeout' in config else config.get(
+            'moneyTimeout', cls.DEFAULT_MONEY_TIMEOUT)
+        if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0):
+            raise ValueError(
+                'money_timeout must be a positive number of seconds or None, got {!r}'.format(
+                    value))
+        return value
+
+    @staticmethod
+    def _longer_timeout(timeout, money_timeout):
+        """
+        Таймаут money-вызова: дольше из общего timeout и money_timeout. None (без ограничения)
+        у любого из них — без ограничения. У пары (connect, read) удлиняется только read:
+        долго ждать приходится ответа, а не соединения. Значение другого вида (например,
+        urllib3.Timeout) — как задал пользователь.
+        """
+        if timeout is None or money_timeout is None:
+            return None
+        if isinstance(timeout, tuple) and len(timeout) == 2:
+            connect, read = timeout
+            return connect, (None if read is None else max(read, money_timeout))
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+            return max(timeout, money_timeout)
+        return timeout
+
+    @staticmethod
+    def _secret_patterns(key):
+        """
+        Шаблоны поиска API-ключа для _redact(): ключ как есть и в URL-кодированном виде (так он
+        стоит в пути), без учёта регистра — фронт-404 стейджа отдаёт путь в нижнем регистре.
+        Пустой ключ не ищется: иначе '***' встал бы между любыми двумя символами.
+
+        Returns:
+            tuple: (шаблон для str, шаблон для bytes) либо (None, None).
+        """
+        forms = sorted({form for form in (key, quote(key, safe=''), quote(key)) if form.strip()},
+                       key=len, reverse=True)
+        if not forms:
+            return None, None
+        return (re.compile('|'.join(re.escape(form) for form in forms), re.IGNORECASE),
+                re.compile(b'|'.join(re.escape(form.encode('utf-8')) for form in forms),
+                           re.IGNORECASE))
+
+    def _redact(self, value):
+        """
+        Копия value без API-ключа: строки, bytes и вложенные dict/list/tuple; остальное — как
+        есть.
+        """
+        text, raw = self._key_patterns
+        if text is None:
+            return value
+        if isinstance(value, str):
+            return text.sub(self.REDACTED, value)
+        if isinstance(value, (bytes, bytearray)):
+            return raw.sub(self.REDACTED.encode('ascii'), bytes(value))
+        if isinstance(value, dict):
+            return {self._redact(name): self._redact(item) for name, item in value.items()}
+        if isinstance(value, list):
+            return [self._redact(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._redact(item) for item in value)
+        return value
+
+    def _redacted(self, error):
+        """
+        Тот же ApiError, но без API-ключа ни в одном поле, которое видит вызывающий: текст
+        (args, а значит str() и repr()), code, custom_data, body, errors.
+        """
+        error.args = self._redact(error.args)
+        error.code = self._redact(error.code)
+        error.custom_data = error.customData = self._redact(error.custom_data)
+        error.body = self._redact(error.body)
+        error.errors = self._redact(error.errors)
+        return error
+
+    def _transport_error(self, error):
+        """
+        ApiError из транспортного исключения requests — без API-ключа.
+
+        Текст requests-исключения содержит URL ("Max retries exceeded with url:
+        /personal/api/v2/<key>/..."), а request.url и цепочка __cause__/__context__ — тем более.
+        Поэтому сырое исключение не цепляется: причиной (__cause__) становится его копия того
+        же класса с отредактированным текстом и без request/response — по ней по-прежнему
+        видно, таймаут это (requests.Timeout) или обрыв соединения (requests.ConnectionError).
+
+        Returns:
+            tuple: (ApiError, отредактированная копия исключения для __cause__).
+        """
+        message = self._redact(str(error))
+        try:
+            cause = type(error)(message)
+        except Exception:
+            # Свой подкласс с другим конструктором — хотя бы базовый тип requests.
+            cause = requests.RequestException(message)
+        response = getattr(error, 'response', None)
+        return self._redacted(ApiError(
+            message, http_status=getattr(response, 'status_code', None),
+            body=getattr(response, 'content', None))), cause
+
+    def _unexpected_response(self, uri, http_status, data):
+        """
+        Ответ money/write без JSON-конверта при HTTP 2xx: HTML, пустое тело, 204, JSON
+        не-объект или объект без status, обрезанный JSON. Успехом это считать нельзя, а
+        неудачей — тоже: запрос мог выполниться, поэтому текст прямо просит проверить, прежде
+        чем повторять. Тело — без ключа и обрезанное до UNEXPECTED_BODY_LIMIT.
+        """
+        body = self._redact(data)
+        if isinstance(body, (str, bytes)) and len(body) > self.UNEXPECTED_BODY_LIMIT:
+            body = body[:self.UNEXPECTED_BODY_LIMIT]
+        return self._redacted(ApiError(
+            'Unexpected response to {} (HTTP {}, no JSON envelope); the request may have been '
+            'executed - check before retrying'.format(str(uri).strip('/'), http_status),
+            http_status=http_status, body=body))
 
     def close(self):
         """Close the underlying requests session."""
@@ -451,6 +609,10 @@ class Api:
     def setPaymentId(self, id):
         """
         Payment system for order/*, prolong/* and balance/add.
+
+        Это значение ПО УМОЛЧАНИЮ для клиента: если в самом вызове передан paymentId или
+        paymentCode, пара setPaymentId()/setPaymentCode() в этот запрос не подмешивается вовсе
+        (см. _payment_for).
 
         Заказы и продления оплачиваются только балансом или привязанной картой: здесь
         подходят 'balance' и 'paddle_subscription' — код (сервер, не найдя ObjectId,
@@ -469,6 +631,9 @@ class Api:
         """
         Payment-system code for order/* and prolong/*: ``balance`` (the account balance) or
         ``paddle_subscription`` (the saved card) — other payment systems are rejected there.
+
+        Значение ПО УМОЛЧАНИЮ для клиента, как и setPaymentId(): платёжка, переданная в вызов
+        (paymentId или paymentCode), главнее, и тогда пара клиента не уходит вовсе.
         """
         self.paymentCode = code
 
@@ -516,6 +681,17 @@ class Api:
         или в полосе записи, а HTTP 429 повторяется по Retry-After. Ожидание в очереди в
         timeout не входит.
 
+        Таймаут: явно переданный здесь timeout — как есть; иначе общий (request_options /
+        timeout конфига), а у money — дольше из общего и money_timeout (_longer_timeout).
+
+        Успех у money и write — ТОЛЬКО конверт со status "success". status "error" с data и
+        пустым errors[] — легальная форма только у */calc (нехватка средств), а они — чтение;
+        у money/write это ошибка API. HTTP 2xx без JSON-конверта у money/write — тоже ошибка:
+        запрос мог выполниться (_unexpected_response). Чтения и скачивания файлов разбираются
+        как раньше.
+
+        API-ключа нет ни в одном ApiError: ни в тексте, ни в body/errors, ни в __cause__.
+
         Args:
             method (str): The HTTP method to use for the request.
             uri (str): The URI to send the request to.
@@ -525,11 +701,18 @@ class Api:
             mixed: The response from the server.
 
         Raises:
-            Exception: If an error occurs during the request.
+            ApiError: ошибка API, неожиданный ответ или транспортная ошибка (http_status None,
+                __cause__ — отредактированная копия исключения requests).
         """
+        category = self.requestCategory(uri)
         request_options = {**self.request_options, **options}
         request_headers = {**self.headers, **request_options.pop('headers', {})}
-        request_timeout = request_options.pop('timeout', self.timeout)
+        if 'timeout' in options:
+            request_timeout = request_options.pop('timeout')
+        else:
+            request_timeout = request_options.pop('timeout', self.timeout)
+            if category == RateLimiter.MONEY:
+                request_timeout = self._longer_timeout(request_timeout, self.money_timeout)
 
         def send():
             try:
@@ -537,12 +720,12 @@ class Api:
                     method, self.base_uri + uri, headers=request_headers,
                     timeout=request_timeout, **request_options)
             except requests.RequestException as error:
-                error_response = getattr(error, 'response', None)
-                raise ApiError(
-                    str(error), http_status=getattr(error_response, 'status_code', None),
-                    body=getattr(error_response, 'content', None)) from error
+                failure, cause = self._transport_error(error)
+            # Поднимаем вне except: иначе сырое исключение (ключ в тексте и в request.url)
+            # осталось бы в __context__ и вывелось бы в traceback, логи и трекер ошибок.
+            raise failure from cause
 
-        response = self.rate_limiter.run(self.requestCategory(uri), send)
+        response = self.rate_limiter.run(category, send)
 
         content_type = response.headers.get('Content-Type', '').lower()
         content_disposition = response.headers.get('Content-Disposition', '').lower()
@@ -560,6 +743,9 @@ class Api:
         else:
             data = response.content
 
+        # money и write: успех — только конверт со status "success" (см. docstring).
+        strict = category != RateLimiter.READ
+        ok = 200 <= response.status_code < 300
         if isinstance(data, dict):
             is_envelope = 'status' in data and ('data' in data or 'errors' in data)
             if is_envelope:
@@ -567,18 +753,21 @@ class Api:
                     return data.get('data')
                 errors = data.get('errors')
                 if isinstance(errors, list) and errors:
-                    raise self._api_error(errors[0], response.status_code, data, errors)
-                if 200 <= response.status_code < 300 and data.get('data') is not None:
+                    raise self._redacted(
+                        self._api_error(errors[0], response.status_code, data, errors))
+                if not strict and ok and data.get('data') is not None:
                     return data.get('data')
-                raise ApiError(
+                raise self._redacted(ApiError(
                     'Client API returned an error',
-                    http_status=response.status_code, body=data)
-            if not 200 <= response.status_code < 300:
-                raise self._api_error(data, response.status_code, data)
-        elif not 200 <= response.status_code < 300:
+                    http_status=response.status_code, body=data))
+            if not ok:
+                raise self._redacted(self._api_error(data, response.status_code, data))
+        elif not ok:
             message = data if isinstance(data, str) and data else 'Client API HTTP {}'.format(response.status_code)
-            raise ApiError(message, http_status=response.status_code, body=data)
+            raise self._redacted(ApiError(message, http_status=response.status_code, body=data))
 
+        if strict:
+            raise self._unexpected_response(uri, response.status_code, data)
         return data
 
     @staticmethod
@@ -778,6 +967,10 @@ class Api:
             paymentId (str): Payment system id (ObjectId-строка из balance/payments/list).
             paymentCode (str): Не поддерживается этим эндпоинтом, см. Raises.
 
+        Платёжка вызова главнее клиентской: если здесь передан непустой paymentId или
+        paymentCode, setPaymentId()/setPaymentCode() не используются вовсе; иначе берётся
+        setPaymentId().
+
         Raises:
             ValueError: если paymentId не задан, а задан только paymentCode. В отличие от
                 order/* и prolong/* эндпоинт balance/add НЕ резолвит код платёжной системы:
@@ -787,18 +980,20 @@ class Api:
         Returns:
             str: A link to the payment page.
         """
-        if paymentId is None:
-            paymentId = self.getPaymentId()
-        if paymentId is None:
-            code = paymentCode or self.getPaymentCode()
-            if code:
+        if self._filled(paymentId) or self._filled(paymentCode):
+            code = paymentCode if self._filled(paymentCode) else None
+            if code is not None and self._filled(paymentId):
                 raise ValueError(
-                    "balance/add does not resolve paymentCode ({!r}): the endpoint accepts "
-                    "only summ and paymentId. Take the id from balancePaymentsList() and pass "
-                    "paymentId (or setPaymentId(...)).".format(code))
-        elif paymentCode:
+                    "balance/add accepts only paymentId, drop paymentCode ({!r})".format(code))
+        else:
+            paymentId, code = self.getPaymentId(), None
+            if not self._filled(paymentId):
+                code = self.getPaymentCode() or None
+        if code is not None:
             raise ValueError(
-                "balance/add accepts only paymentId, drop paymentCode ({!r})".format(paymentCode))
+                "balance/add does not resolve paymentCode ({!r}): the endpoint accepts "
+                "only summ and paymentId. Take the id from balancePaymentsList() and pass "
+                "paymentId (or setPaymentId(...)).".format(code))
         return self.request('POST', 'balance/add', json={'summ': summ, 'paymentId': paymentId})['url']
 
     def balancePaymentsList(self):
@@ -965,6 +1160,50 @@ class Api:
             return {'paymentCode': self.getPaymentCode()}
         return {'paymentId': self.getPaymentId()}
 
+    #: Поля, которыми вызов приносит свою платёжку. payment_id — snake-алиас paymentId, его
+    #: принимает autoprolong/*; учитывается только там, где он есть в белом списке полей.
+    CALL_PAYMENT_FIELDS = ('paymentId', 'paymentCode', 'payment_id')
+
+    @staticmethod
+    def _filled(value):
+        """Задано ли значение для сервера: None и строка из одних пробелов — "не задано"."""
+        return value is not None and str(value).strip() != ''
+
+    def _payment_for(self, values, fields=('paymentId', 'paymentCode')):
+        """
+        Платёжка клиента для тела запроса — с учётом платёжки самого вызова.
+
+        setPaymentId()/setPaymentCode() — значение ПО УМОЛЧАНИЮ: если в вызове (values) есть
+        непустое поле из fields, пара клиента в запрос не подмешивается вовсе — ни id, ни code.
+        Раньше они смешивались, и правило "code старше id" отдавало победу коду КЛИЕНТА:
+        prolongMake(..., paymentId='balance') после setPaymentCode('paddle_subscription')
+        списывал с привязанной карты. Внутри одного уровня (только вызов или только клиент)
+        приоритет прежний: code старше id.
+
+        Пустое платёжное поле вызова (None, '', пробелы) — "не передано": оно убирается, чтобы
+        не затереть платёжку клиента.
+
+        Returns:
+            tuple: (платёжка клиента — dict, пустой, если у вызова своя; values без пустых
+                платёжных полей).
+        """
+        values = {key: value for key, value in values.items()
+                  if key not in fields or self._filled(value)}
+        if any(key in values for key in fields):
+            return {}, values
+        return self.paymentOptions(), values
+
+    def _merge_order(self, payload, options):
+        """
+        mergeOrderOptions() для prepare*: платёжка клиента подмешивается, только если в вызове
+        нет своей (_payment_for).
+        """
+        values = options or {}
+        if not isinstance(values, dict):
+            raise TypeError('order options must be a dict')
+        client_payment, values = self._payment_for(values)
+        return self.mergeOrderOptions({**client_payment, **payload}, values)
+
     #: Пары *Id/*Code для order/* и то, кто из них СТАРШЕ на сервере
     #: (True = старше *Code). Это все пары, которые сервер резолвит у order/*.
     ORDER_REFERENCE_PAIRS = (
@@ -1043,33 +1282,28 @@ class Api:
     def prepareRegular(self, sectionCode, countryId=None, periodId=None, quantity=None,
                        authorization=None, coupon=None, customTargetName=None, options=None):
         if isinstance(countryId, dict):
-            return self.mergeOrderOptions(
-                {**self.paymentOptions(), 'sectionCode': sectionCode},
-                {**countryId, **(options or {})})
-        return self.mergeOrderOptions({
-            **self.paymentOptions(), 'sectionCode': sectionCode, 'countryId': countryId,
+            return self._merge_order(
+                {'sectionCode': sectionCode}, {**countryId, **(options or {})})
+        return self._merge_order({
+            'sectionCode': sectionCode, 'countryId': countryId,
             'periodId': periodId, 'quantity': quantity, 'authorization': authorization,
             'coupon': coupon, 'customTargetName': customTargetName}, options)
 
     def prepareMix(self, mixId=None, periodId=None, quantity=None, authorization=None,
                    coupon=None, customTargetName=None, options=None):
         if isinstance(mixId, dict):
-            return self.mergeOrderOptions(
-                {**self.paymentOptions(), 'sectionCode': 'mix'},
-                {**mixId, **(options or {})})
-        return self.mergeOrderOptions({
-            **self.paymentOptions(), 'sectionCode': 'mix', 'mixId': mixId,
+            return self._merge_order({'sectionCode': 'mix'}, {**mixId, **(options or {})})
+        return self._merge_order({
+            'sectionCode': 'mix', 'mixId': mixId,
             'periodId': periodId, 'quantity': quantity, 'authorization': authorization,
             'coupon': coupon, 'customTargetName': customTargetName}, options)
 
     def prepareIpv6(self, countryId=None, periodId=None, quantity=None, authorization=None,
                     coupon=None, customTargetName=None, protocol=None, options=None):
         if isinstance(countryId, dict):
-            return self.mergeOrderOptions(
-                {**self.paymentOptions(), 'sectionCode': 'ipv6'},
-                {**countryId, **(options or {})})
-        return self.mergeOrderOptions({
-            **self.paymentOptions(), 'sectionCode': 'ipv6', 'countryId': countryId,
+            return self._merge_order({'sectionCode': 'ipv6'}, {**countryId, **(options or {})})
+        return self._merge_order({
+            'sectionCode': 'ipv6', 'countryId': countryId,
             'periodId': periodId, 'quantity': quantity, 'authorization': authorization,
             'coupon': coupon, 'customTargetName': customTargetName, 'protocol': protocol}, options)
 
@@ -1081,27 +1315,23 @@ class Api:
         ObjectId ЛИБО код, rotationId — ЧИСЛО МИНУТ (0 = "By Link"), кодов у него нет.
         """
         if isinstance(countryId, dict):
-            return self.mergeOrderOptions({
-                **self.paymentOptions(), 'sectionCode': 'mobile',
-                'mobileServiceType': 'dedicated'},
+            return self._merge_order(
+                {'sectionCode': 'mobile', 'mobileServiceType': 'dedicated'},
                 {**countryId, **(options or {})})
         if isinstance(mobileServiceType, dict):
             options = mobileServiceType
             mobileServiceType = 'dedicated'
-        return self.mergeOrderOptions({
-            **self.paymentOptions(), 'sectionCode': 'mobile', 'countryId': countryId,
+        return self._merge_order({
+            'sectionCode': 'mobile', 'countryId': countryId,
             'periodId': periodId, 'quantity': quantity, 'authorization': authorization,
             'coupon': coupon, 'operatorId': operatorId, 'rotationId': rotationId,
             'mobileServiceType': mobileServiceType}, options)
 
     def prepareResident(self, tarifId=None, coupon=None, options=None):
         if isinstance(tarifId, dict):
-            return self.mergeOrderOptions(
-                {**self.paymentOptions(), 'sectionCode': 'resident'},
-                {**tarifId, **(options or {})})
-        return self.mergeOrderOptions({
-            **self.paymentOptions(), 'sectionCode': 'resident',
-            'tarifId': tarifId, 'coupon': coupon}, options)
+            return self._merge_order({'sectionCode': 'resident'}, {**tarifId, **(options or {})})
+        return self._merge_order({
+            'sectionCode': 'resident', 'tarifId': tarifId, 'coupon': coupon}, options)
 
     def withGenerateAuth(self, data):
         """
@@ -1549,9 +1779,10 @@ class Api:
     def _prolongPayload(self, targets, type, defaults, values, fields, what,
                         package_types=()):
         """
-        Общая сборка тела prolong/* и autoprolong/*: платёжка клиента, выбор из targets
-        (_splitProlongTargets), значения по умолчанию и поля из белого списка fields —
-        переданные явно, они сильнее. Пустые поля выбора не отправляются.
+        Общая сборка тела prolong/* и autoprolong/*: платёжка клиента (только если в values
+        нет своей — _payment_for), выбор из targets (_splitProlongTargets), значения по
+        умолчанию и поля из белого списка fields — переданные явно, они сильнее. Пустые поля
+        выбора не отправляются.
 
         Raises:
             TypeError: если values не dict.
@@ -1564,8 +1795,10 @@ class Api:
         if not isinstance(values, dict):
             raise TypeError('{} options must be a dict'.format(what))
         self._assert_no_removed_prolong_fields(values)
+        client_payment, values = self._payment_for(
+            values, [key for key in self.CALL_PAYMENT_FIELDS if key in fields])
         payload = {
-            **self.paymentOptions(), **self._splitProlongTargets(targets, type), **defaults}
+            **client_payment, **self._splitProlongTargets(targets, type), **defaults}
         for key in fields:
             if key in values:
                 payload[key] = values[key]

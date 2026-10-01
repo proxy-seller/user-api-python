@@ -6,11 +6,17 @@ Client API v2, а не README.
 """
 
 import json
+import pickle
+import socket
+import traceback
 import unittest
+
+import requests
 
 from proxy_seller_user_api import Api, ApiError
 
-from .support import FakeClock, FakeSession, envelope, error_envelope, json_file, text_file
+from .support import (NO_JSON, FakeClock, FakeResponse, FakeSession, envelope, error_envelope,
+                      json_file, text_file)
 
 
 def make_api(responses=None, **config):
@@ -934,6 +940,430 @@ class OrderListTest(unittest.TestCase):
         api, session = make_api([envelope({'metadata': {}, 'items': []})])
         api.orderList(order_id=None, status='NOT_PAYED')
         self.assertEqual(session.last['params'], {'status': 'NOT_PAYED'})
+
+
+#: Аргументы таблицы вызовов CallPaymentWinsTest.CALLS.
+SEO = {'customTargetName': 'seo'}
+OPERATOR = {'operatorId': 'op', 'rotationId': 5}
+MIX = 'europe-2-mix_IPv4'
+PROXY_ID = '68b1f0c4e13a4c0f1a2b3c4d'
+ORDER_ID = '6a248de4717805635cf6057d'
+
+
+class CallPaymentWinsTest(unittest.TestCase):
+    """
+    setPaymentId()/setPaymentCode() — значение по умолчанию: непустой paymentId ИЛИ
+    paymentCode в самом вызове убирает пару клиента из запроса целиком. Раньше они
+    смешивались, и "code старше id" отдавал победу коду клиента: prolongMake(...,
+    paymentId='balance') после setPaymentCode('paddle_subscription') списывал с карты.
+    """
+
+    #: Все места, где подмешивается платёжка клиента: (путь, вызов с платёжкой вызова).
+    CALLS = (
+        ('order/calc', lambda api, pay: api.orderCalcIpv4('USA', '1m', 1, **SEO, **pay)),
+        ('order/calc', lambda api, pay: api.orderCalcIsp('USA', '1m', 1, **SEO, **pay)),
+        ('order/calc', lambda api, pay: api.orderCalcMix(MIX, '1m', 1, **pay)),
+        ('order/calc', lambda api, pay: api.orderCalcIpv6('USA', '1m', 1, **SEO, **pay)),
+        ('order/calc', lambda api, pay: api.orderCalcMobile('USA', '1m', 1, **OPERATOR, **pay)),
+        ('order/calc', lambda api, pay: api.orderCalcResident('1-gb', **pay)),
+        ('order/make', lambda api, pay: api.orderMakeIpv4('USA', '1m', 1, **SEO, **pay)),
+        ('order/make', lambda api, pay: api.orderMakeIsp('USA', '1m', 1, **SEO, **pay)),
+        ('order/make', lambda api, pay: api.orderMakeMix(MIX, '1m', 1, **pay)),
+        ('order/make', lambda api, pay: api.orderMakeMixByCode(MIX, '1m', 1, **pay)),
+        ('order/make', lambda api, pay: api.orderMakeIpv6('USA', '1m', 1, **SEO, **pay)),
+        ('order/make', lambda api, pay: api.orderMakeMobile('USA', '1m', 1, **OPERATOR, **pay)),
+        ('order/make', lambda api, pay: api.orderMakeResident('1-gb', **pay)),
+        ('order/make', lambda api, pay: api.orderMakeIpv4(
+            {'countryId': 'USA', 'periodId': '1m', 'quantity': 1, **SEO, **pay})),
+        ('order/make', lambda api, pay: api.orderMakeResident('1-gb', options=dict(pay))),
+        ('prolong/calc/ipv4', lambda api, pay: api.prolongCalc('ipv4', ['1.2.3.4'], '1m', **pay)),
+        ('prolong/make/ipv6', lambda api, pay: api.prolongMake('ipv6', [ORDER_ID], '1m', **pay)),
+        ('prolong/make/isp', lambda api, pay: api.prolongMake(
+            'isp', {'ids': [PROXY_ID], 'periodId': '1m', **pay})),
+        ('autoprolong/calc/mix', lambda api, pay: api.autoProlongCalc(
+            'mix', [ORDER_ID], '1m', options=dict(pay))),
+        ('autoprolong/enable/ipv4', lambda api, pay: api.autoProlongEnable(
+            'ipv4', ['1.2.3.4'], '1m', **pay)),
+        ('autoprolong/enable/resident', lambda api, pay: api.autoProlongEnable('resident', **pay)),
+    )
+
+    def check(self, client_setter, client_value, call_payment, expected):
+        for index, (path, call) in enumerate(self.CALLS):
+            with self.subTest(call=index, path=path):
+                api, session = make_api([envelope({'total': 1})])
+                getattr(api, client_setter)(client_value)
+                call(api, call_payment)
+                self.assertTrue(session.last['url'].endswith(path))
+                body = session.last['json']
+                for key in ('paymentId', 'paymentCode'):
+                    if key in expected:
+                        self.assertEqual(body.get(key), expected[key])
+                    else:
+                        self.assertNotIn(key, body)
+
+    def test_call_payment_id_drops_the_client_payment_code(self):
+        self.check('setPaymentCode', 'paddle_subscription', {'paymentId': 'balance'},
+                   {'paymentId': 'balance'})
+
+    def test_call_payment_code_drops_the_client_payment_id(self):
+        self.check('setPaymentId', 'balance', {'paymentCode': 'paddle_subscription'},
+                   {'paymentCode': 'paddle_subscription'})
+
+    def test_client_payment_is_used_when_the_call_has_none(self):
+        """Пустое значение в вызове (None, '', пробелы) — "не передано": берётся клиентская."""
+        for blank in ({}, {'paymentId': None}, {'paymentId': ''}, {'paymentCode': '  '},
+                      {'paymentId': '', 'paymentCode': None}):
+            with self.subTest(call_payment=blank):
+                self.check('setPaymentCode', 'balance', blank, {'paymentCode': 'balance'})
+
+    def test_code_still_wins_over_id_within_the_call(self):
+        api, session = make_api([envelope({'orderId': 'O1'})])
+        api.setPaymentId('CLIENT_PAYMENT_ID')
+        api.orderMakeResident('1-gb', paymentId='CALL_PAYMENT_ID', paymentCode='balance')
+        self.assertEqual(session.last['json'], {
+            'sectionCode': 'resident', 'tarifId': '1-gb', 'paymentCode': 'balance'})
+
+    def test_snake_case_payment_id_counts_for_autoprolong(self):
+        api, session = make_api([envelope({'autoProlong': True})])
+        api.setPaymentCode('paddle_subscription')
+        api.autoProlongEnable('ipv4', [PROXY_ID], '1m', payment_id='balance')
+        self.assertEqual(session.last['json'], {
+            'ids': [PROXY_ID], 'periodId': '1m', 'payment_id': 'balance'})
+
+    def test_order_make_with_a_dict_body_is_sent_as_given(self):
+        api, session = make_api([envelope({'orderId': 'O1'})])
+        api.setPaymentCode('paddle_subscription')
+        api.orderMake({'sectionCode': 'resident', 'tarifId': '1-gb', 'paymentId': 'balance'})
+        self.assertEqual(session.last['json'], {
+            'sectionCode': 'resident', 'tarifId': '1-gb', 'paymentId': 'balance'})
+
+    def test_balance_add_call_payment_wins(self):
+        api, session = make_api([envelope({'url': 'https://pay/1'})])
+        api.setPaymentCode('paddle_subscription')
+        api.setPaymentId('CLIENT_PAYMENT_ID')
+        api.balanceAdd(10, 'CALL_PAYMENT_ID')
+        self.assertEqual(session.last['json'], {'summ': 10, 'paymentId': 'CALL_PAYMENT_ID'})
+
+    def test_balance_add_call_code_does_not_borrow_the_client_id(self):
+        """Код в вызове: клиентский id не подставляется, а balance/add кодов не резолвит."""
+        api, session = make_api()
+        api.setPaymentId('CLIENT_PAYMENT_ID')
+        with self.assertRaises(ValueError) as ctx:
+            api.balanceAdd(10, paymentCode='cryptomus')
+        self.assertIn('does not resolve paymentCode', str(ctx.exception))
+        self.assertEqual(session.calls, [])
+
+    def test_balance_add_blank_call_payment_falls_back_to_the_client(self):
+        for blank in ('', '  '):
+            with self.subTest(payment_id=blank):
+                api, session = make_api([envelope({'url': 'https://pay/2'})])
+                api.setPaymentId('CLIENT_PAYMENT_ID')
+                api.balanceAdd(5, blank, paymentCode='')
+                self.assertEqual(session.last['json'],
+                                 {'summ': 5, 'paymentId': 'CLIENT_PAYMENT_ID'})
+
+
+class KeyRedactionTest(unittest.TestCase):
+    """
+    Ключ стоит в пути URL. Ни текст ApiError, ни его repr/traceback/сериализация, ни body,
+    errors и __cause__ не должны его содержать — ни как есть, ни URL-кодированным, ни в нижнем
+    регистре (фронт-404 стейджа отдаёт путь в нижнем регистре).
+    """
+
+    KEY = 'Sec+ret/Key=42'
+    ENCODED = 'Sec%2Bret%2FKey%3D42'
+    SECRETS = (KEY, ENCODED, 'Sec%2Bret/Key%3D42')
+
+    def api(self, responses=None, **config):
+        return make_api(responses, key=self.KEY, **config)
+
+    def assertNoKey(self, error):
+        rendered = (
+            str(error), repr(error),
+            ''.join(traceback.format_exception(type(error), error, error.__traceback__)),
+            json.dumps(vars(error), default=repr),
+        )
+        for text in rendered:
+            for secret in self.SECRETS:
+                self.assertNotIn(secret.lower(), text.lower())
+        dumped = pickle.dumps(error).lower()
+        for secret in self.SECRETS:
+            self.assertNotIn(secret.lower().encode(), dumped)
+
+    def test_network_error_on_a_closed_port(self):
+        """Настоящий requests: "Max retries exceeded with url: /personal/api/v2/<key>/..."."""
+        probe = socket.socket()
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        api = Api({'key': self.KEY, 'timeout': 0.5, 'rate_limit': False,
+                   'base_url': 'http://127.0.0.1:{}/personal/api/v2/'.format(port)})
+        with api, self.assertRaises(ApiError) as ctx:
+            api.balance()
+        error = ctx.exception
+        self.assertIsNone(error.http_status)
+        self.assertIn('/personal/api/v2/***/balance/get', str(error))
+        # Причина — копия исключения requests того же вида, без request/response; сырое
+        # исключение не прицеплено ни как __cause__, ни как __context__.
+        self.assertIsInstance(error.__cause__, requests.ConnectionError)
+        self.assertIsNone(error.__cause__.request)
+        self.assertIsNone(error.__context__)
+        self.assertNoKey(error)
+        self.assertNoKey(error.__cause__)
+
+    def test_timeout_keeps_its_type_without_the_request(self):
+        class Request:
+            url = 'https://proxy-seller.com/personal/api/v2/{}/order/make'.format(self.ENCODED)
+
+        api, _ = self.api([requests.ReadTimeout(
+            "HTTPSConnectionPool(host='proxy-seller.com', port=443): Read timed out. "
+            "(read timeout=120)", request=Request())])
+        with self.assertRaises(ApiError) as ctx:
+            api.orderMakeResident('1-gb')
+        cause = ctx.exception.__cause__
+        self.assertIsInstance(cause, requests.Timeout)
+        self.assertIsNone(cause.request)
+        self.assertIn('Read timed out', str(ctx.exception))
+        self.assertNoKey(ctx.exception)
+
+    def test_html_404_echoing_the_lowercase_path(self):
+        page = ('<html><h1>404 Not Found</h1><p>/personal/api/v2/{}/balance/get</p>'
+                '</html>').format(self.ENCODED.lower())
+        api, _ = self.api([FakeResponse(
+            NO_JSON, status_code=404, headers={'Content-Type': 'text/html; charset=UTF-8'},
+            text=page, content=page.encode())])
+        with self.assertRaises(ApiError) as ctx:
+            api.balance()
+        self.assertEqual(ctx.exception.http_status, 404)
+        self.assertIn('/personal/api/v2/***/balance/get', str(ctx.exception))
+        self.assertIn('***', ctx.exception.body)
+        self.assertNoKey(ctx.exception)
+
+    def test_json_500_echoing_the_path(self):
+        body = {'error': 'Internal Server Error', 'status': 500,
+                'message': 'No handler for /personal/api/v2/{}/order/make'.format(self.ENCODED),
+                'path': '/personal/api/v2/{}/order/make'.format(self.ENCODED.lower()),
+                'key': self.KEY}
+        api, _ = self.api([FakeResponse(body, status_code=500)])
+        with self.assertRaises(ApiError) as ctx:
+            api.orderMakeResident('1-gb')
+        error = ctx.exception
+        self.assertEqual(error.http_status, 500)
+        self.assertEqual(str(error), 'No handler for /personal/api/v2/***/order/make')
+        self.assertEqual(error.body['path'], '/personal/api/v2/***/order/make')
+        self.assertEqual(error.errors[0]['key'], '***')
+        self.assertNoKey(error)
+
+    def test_envelope_error_and_bytes_body(self):
+        api, _ = self.api([
+            error_envelope([{'message': 'Bad key {}'.format(self.KEY), 'code': 0,
+                             'customData': {'path': self.ENCODED}}]),
+            FakeResponse(NO_JSON, status_code=502,
+                         headers={'Content-Type': 'application/octet-stream'},
+                         content=b'upstream /personal/api/v2/' + self.ENCODED.lower().encode())])
+        with self.assertRaises(ApiError) as ctx:
+            api.authList()
+        self.assertEqual(str(ctx.exception), 'Bad key ***')
+        self.assertEqual(ctx.exception.custom_data, {'path': '***'})
+        self.assertEqual(ctx.exception.customData, {'path': '***'})
+        self.assertNoKey(ctx.exception)
+        with self.assertRaises(ApiError) as ctx:
+            api.authList()
+        self.assertEqual(ctx.exception.body, b'upstream /personal/api/v2/***')
+        self.assertNoKey(ctx.exception)
+
+    def test_client_representation_has_no_key(self):
+        api, _ = self.api()
+        self.assertNotIn(self.ENCODED.lower(), repr(api).lower())
+        self.assertNotIn(self.KEY.lower(), str(api).lower())
+
+
+class StrictMoneyAndWriteSuccessTest(unittest.TestCase):
+    """
+    money и write: успех — только конверт со status "success". status "error" с data и пустым
+    errors[] легален только у */calc (чтение); HTTP 2xx без конверта у money/write — ошибка
+    "the request may have been executed". Чтения и файлы разбираются как раньше.
+    """
+
+    UNEXPECTED = 'no JSON envelope); the request may have been executed - check before retrying'
+
+    @staticmethod
+    def html(body, status=200):
+        return FakeResponse(NO_JSON, status_code=status, headers={'Content-Type': 'text/html'},
+                            text=body, content=body.encode())
+
+    NO_ENVELOPE = {
+        'html': lambda: StrictMoneyAndWriteSuccessTest.html('<html>Bad gateway</html>'),
+        'empty json': lambda: FakeResponse(NO_JSON, content=b''),
+        '204': lambda: FakeResponse(NO_JSON, status_code=204, headers={}, content=b''),
+        'truncated json': lambda: FakeResponse(NO_JSON, content=b'{"status": "succ'),
+        'json list': lambda: FakeResponse([{'orderId': 'O1'}]),
+        'json string': lambda: FakeResponse('ok'),
+        'json null': lambda: FakeResponse(None),
+        'object without status': lambda: FakeResponse({'orderId': 'O1', 'total': 10}),
+    }
+
+    MONEY_AND_WRITE = (
+        ('order/make', lambda api: api.orderMakeResident('1-gb')),
+        ('prolong/make/ipv4', lambda api: api.prolongMake('ipv4', ['1.2.3.4'], '1m')),
+        ('balance/add', lambda api: api.balanceAdd(10, 'PAYMENT_ID')),
+        ('auth/add', lambda api: api.authAdd('ORDER-1')),
+        ('autoprolong/enable/ipv4', lambda api: api.autoProlongEnable(
+            'ipv4', ['1.2.3.4'], '1m', paymentId='balance')),
+        ('residentsubuser/delete', lambda api: api.residentSubUserDelete('KEY')),
+    )
+
+    def test_answer_without_an_envelope_is_an_error(self):
+        for path, call in self.MONEY_AND_WRITE:
+            for kind, response in self.NO_ENVELOPE.items():
+                with self.subTest(path=path, response=kind):
+                    api, session = make_api([response()])
+                    with self.assertRaises(ApiError) as ctx:
+                        call(api)
+                    self.assertTrue(session.last['url'].endswith(path))
+                    self.assertIn('Unexpected response to ' + path, str(ctx.exception))
+                    self.assertIn(self.UNEXPECTED, str(ctx.exception))
+                    self.assertEqual(ctx.exception.http_status, response().status_code)
+                    self.assertEqual(ctx.exception.errors, [])
+
+    def test_unexpected_body_is_redacted_and_truncated(self):
+        page = '<html>' + 'x' * 2000 + '/personal/api/v2/api-key/order/make</html>'
+        api, _ = make_api([self.html('<p>/personal/api/v2/api-key/order/make</p>'),
+                           self.html(page)])
+        with self.assertRaises(ApiError) as ctx:
+            api.orderMakeResident('1-gb')
+        self.assertEqual(ctx.exception.body, '<p>/personal/api/v2/***/order/make</p>')
+        with self.assertRaises(ApiError) as ctx:
+            api.orderMakeResident('1-gb')
+        self.assertEqual(len(ctx.exception.body), Api.UNEXPECTED_BODY_LIMIT)
+        self.assertTrue(page.startswith(ctx.exception.body))
+
+    def test_error_status_with_data_and_no_errors_fails_make_and_write(self):
+        for path, call in self.MONEY_AND_WRITE:
+            with self.subTest(path=path):
+                api, _ = make_api([envelope({'orderId': 'O1', 'total': 10}, status='error')])
+                with self.assertRaises(ApiError) as ctx:
+                    call(api)
+                self.assertEqual(str(ctx.exception), 'Client API returned an error')
+                self.assertEqual(ctx.exception.http_status, 200)
+                self.assertEqual(ctx.exception.body['data'], {'orderId': 'O1', 'total': 10})
+
+    def test_errors_in_the_envelope_still_raise_as_before(self):
+        api, _ = make_api([error_envelope(
+            [{'message': 'Insufficient funds on balance', 'code': 16}])])
+        with self.assertRaises(ApiError) as ctx:
+            api.orderMakeResident('1-gb')
+        self.assertEqual(ctx.exception.code, 16)
+
+    def test_calc_with_insufficient_funds_still_returns_data(self):
+        warning = {'warning': 'Insufficient funds. Total $3.00. Not enough $7.00', 'total': 10}
+        cases = (
+            lambda api: api.prolongCalc('ipv4', ['1.2.3.4'], '1m'),
+            lambda api: api.autoProlongCalc('ipv4', ['1.2.3.4'], '1m', paymentId='balance'),
+            lambda api: api.autoProlongCalc('resident', paymentId='balance'),
+            lambda api: api.orderCalc({'sectionCode': 'resident', 'tarifId': '1-gb'}),
+        )
+        for index, call in enumerate(cases):
+            with self.subTest(call=index):
+                api, _ = make_api([envelope(warning, status='error')])
+                self.assertEqual(call(api), warning)
+
+    def test_reads_and_files_are_parsed_as_before(self):
+        api, _ = make_api([
+            self.html('<html>plain page</html>'),
+            FakeResponse({'items': []}),
+            envelope({'items': [1]}, status='error'),
+            text_file('1.2.3.4:8080'),
+            json_file('[{"code": "US"}]'),
+        ])
+        self.assertEqual(api.request('GET', 'proxy/list'), '<html>plain page</html>')
+        self.assertEqual(api.request('GET', 'proxy/list/ipv4'), {'items': []})
+        self.assertEqual(api.proxyList('ipv4'), {'items': [1]})
+        self.assertEqual(api.proxyDownload('ipv4', ext='txt'), '1.2.3.4:8080')
+        self.assertEqual(api.residentGeo(), b'[{"code": "US"}]')
+
+    def test_delete_not_found_inside_a_success_envelope_is_kept(self):
+        cases = (
+            (lambda api: api.residentSubUserDelete('KEY'), {'status': 'not-found'}),
+            (lambda api: api.residentSubUserListDelete('KEY', 1), {'status': 'not-found'}),
+            (lambda api: api.residentListDelete(1), {'status': 'delete'}),
+        )
+        for index, (call, expected) in enumerate(cases):
+            with self.subTest(call=index):
+                payload = json.dumps(expected) if expected['status'] == 'not-found' else 'delete'
+                api, _ = make_api([envelope(payload)])
+                self.assertEqual(call(api), expected)
+
+
+class MoneyTimeoutTest(unittest.TestCase):
+    """
+    money (order/make, prolong/make/{type}, balance/add) ждёт до 120 с, остальное — прежние
+    30 с; заданный общий таймаут длиннее — money берёт его. Явный timeout вызова — как есть.
+    """
+
+    MONEY = (
+        lambda api: api.orderMakeResident('1-gb'),
+        lambda api: api.prolongMake('ipv4', ['1.2.3.4'], '1m'),
+        lambda api: api.balanceAdd(10, 'PAYMENT_ID'),
+    )
+    OTHER = (
+        lambda api: api.balance(),
+        lambda api: api.orderCalc({'sectionCode': 'resident', 'tarifId': '1-gb'}),
+        lambda api: api.authAdd('ORDER-1'),
+        lambda api: api.autoProlongEnable('ipv4', ['1.2.3.4'], '1m', paymentId='balance'),
+    )
+
+    @staticmethod
+    def ok():
+        return envelope({'summ': 1, 'url': 'https://pay', 'orderId': 'O1'})
+
+    def timeouts(self, calls, **config):
+        api, session = make_api([self.ok() for _ in calls], **config)
+        for call in calls:
+            call(api)
+        return [call['timeout'] for call in session.calls]
+
+    def test_defaults(self):
+        self.assertEqual(self.timeouts(self.MONEY), [120, 120, 120])
+        self.assertEqual(self.timeouts(self.OTHER), [30, 30, 30, 30])
+        api, _ = make_api()
+        self.assertEqual((api.timeout, api.money_timeout), (30, 120))
+
+    def test_money_uses_the_longer_of_both(self):
+        self.assertEqual(self.timeouts(self.MONEY, timeout=10), [120, 120, 120])
+        self.assertEqual(self.timeouts(self.OTHER, timeout=10), [10, 10, 10, 10])
+        self.assertEqual(self.timeouts(self.MONEY, timeout=300), [300, 300, 300])
+        self.assertEqual(self.timeouts(self.MONEY, request_options={'timeout': 200}),
+                         [200, 200, 200])
+        self.assertEqual(self.timeouts(self.OTHER, request_options={'timeout': 15}),
+                         [15, 15, 15, 15])
+
+    def test_money_timeout_option(self):
+        for key in ('money_timeout', 'moneyTimeout'):
+            with self.subTest(key=key):
+                self.assertEqual(self.timeouts(self.MONEY, **{key: 200}), [200, 200, 200])
+                self.assertEqual(self.timeouts(self.OTHER, **{key: 200}), [30, 30, 30, 30])
+        self.assertEqual(self.timeouts(self.MONEY, money_timeout=None), [None, None, None])
+        self.assertEqual(self.timeouts(self.MONEY, money_timeout=5), [30, 30, 30])
+
+    def test_connect_read_pair_and_no_limit(self):
+        self.assertEqual(self.timeouts(self.MONEY[:1], timeout=(3.05, 30)), [(3.05, 120)])
+        self.assertEqual(self.timeouts(self.OTHER[:1], timeout=(3.05, 30)), [(3.05, 30)])
+        self.assertEqual(self.timeouts(self.MONEY[:1], timeout=(3.05, None)), [(3.05, None)])
+        self.assertEqual(self.timeouts(self.MONEY[:1], timeout=None), [None])
+
+    def test_explicit_call_timeout_is_used_as_is(self):
+        api, session = make_api([self.ok()])
+        api.request('POST', 'order/make', json={'sectionCode': 'resident'}, timeout=7)
+        self.assertEqual(session.last['timeout'], 7)
+
+    def test_invalid_money_timeout(self):
+        for value in (0, -1, '120', True, float('nan'), float('inf'), (5, 120)):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    make_api(money_timeout=value)
+        with self.assertRaises(ValueError):
+            make_api(money_timeout=60, moneyTimeout=60)
 
 
 if __name__ == '__main__':

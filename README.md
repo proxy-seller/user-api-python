@@ -40,6 +40,19 @@ Any other payment system — a one-off card or crypto checkout — needs a brows
 programmatic client cannot complete, so `order/*` and `prolong/*` reject it. `order/make`
 requires a payment; `order/calc` and `prolong/*` also work without one.
 
+`setPaymentCode()` and `setPaymentId()` set the client's **default**. A payment passed to a call
+wins: when a call carries a non-empty `paymentId` or `paymentCode`, the client's pair is left out
+of that request entirely.
+
+```python
+api.setPaymentCode('paddle_subscription')
+api.prolongMake('ipv4', ['1.2.3.4'], '1m', paymentId='balance')  # the balance pays, not the card
+```
+
+Within one level the server rule stays: when a call passes both, `paymentCode` wins over
+`paymentId`, and the same goes for the two setters. When one `Api` instance is shared between
+threads, pass the payment with each call instead of switching the default.
+
 `balancePaymentsList()` is not the place to pick an order payment from: it lists the systems for
 topping the balance up with `balanceAdd()` and never includes the balance itself. That top-up is
 the one place where an id is unavoidable — several payment systems share the same code (a single
@@ -120,6 +133,30 @@ Two responses fall outside the envelope entirely:
 * an invalid `ext` on a download is rejected with a bare plain-text HTTP 400. The library
   validates `ext` locally (`assertExt`) to avoid it: max 250 chars, no `CR`, `LF`, `/`, `\`.
 
+Money and write requests (see the groups in
+[Rate limits and the request queue](#rate-limits-and-the-request-queue)) succeed only with
+`status: "success"`. `status: "error"` with a filled `data` and an empty `errors[]` is a legal
+answer of `prolong/calc` and `autoprolong/calc` alone — not enough money on the balance — and
+those reads still return `data`; on a money or write request the same shape raises `ApiError`,
+and so does a 2xx answer without the envelope (see
+[Timeouts and retries on payments](#timeouts-and-retries-on-payments)).
+
+### The API key in errors and logs
+
+The key is part of the URL path. Every `ApiError` has it replaced with `***`: in the message,
+`body`, `errors`, `custom_data` and in `error.__cause__` — for a network error that is a copy of
+the `requests` exception of the same class, without the request and the response. Any letter
+case and the URL-encoded form are replaced too.
+
+What the library cannot clean up is the debug logging of `urllib3`: at `DEBUG` level it logs
+every request line, key included (`"POST /personal/api/v2/<key>/order/make HTTP/1.1" 200`). If
+your application runs the root logger at `DEBUG`, keep `urllib3` above it:
+
+```python
+import logging
+logging.getLogger('urllib3').setLevel(logging.INFO)
+```
+
 ## Rate limits and the request queue
 
 The API accepts up to 1000 requests per minute per key. By default the client paces its own
@@ -160,7 +197,8 @@ What the client does, with the defaults:
    that order right now, and a retry could extend it twice. It also includes the access-denied
    triple (`Error api key` / `IP not allowed …` / `Request limit reached`, see
    [Errors](#errors)), which cannot be told apart from a wrong key or IP. Network errors are
-   not retried either.
+   not retried either — on a money request they leave the outcome unknown, see
+   [Timeouts and retries on payments](#timeouts-and-retries-on-payments).
 
 Waiting blocks the calling thread, and the time spent in the queue is not part of `timeout`.
 The queue is thread-safe: threads that share one `Api` instance share its window and its write
@@ -193,6 +231,51 @@ nothing about each other's requests, even with the same key, so together they ca
 over the limits. Share one instance per key where you can, or give each instance a share of
 `requests_per_minute`. Where several processes use a key at the same time, the server can
 still answer with code `57` or with the access-denied triple — handle them as described above.
+
+## Timeouts and retries on payments
+
+Every request waits up to `timeout` seconds, 30 by default. The money requests — `order/make`,
+`prolong/make/{type}` and `balance/add` — wait up to `money_timeout`, 120 seconds by default: a
+large order (a MIX order across dozens of countries, for example) can take longer than 30
+seconds on the server. When `timeout` is longer, money requests use `timeout`; with a
+`(connect, read)` pair only the read part is extended; `None` means no limit, as in `requests`.
+A `timeout` passed to `api.request()` for a single call is used as given.
+
+```python
+api = Api({'key': 'YOUR_API_KEY', 'timeout': 30, 'money_timeout': 180})  # or 'moneyTimeout'
+```
+
+**A timeout, a dropped connection or a 5xx on a money request means the outcome is unknown.**
+The request may have reached the API and completed: the order may be created and paid, the
+renewal made, the top-up issued. The library never repeats these requests by itself — the only
+automatic repeat is an HTTP 429 from the edge, which means the request never reached the API.
+Check what happened before you send the request again:
+
+* `order/make` — look for the new order in `orderList(sort_by='date_insert', order='desc')`;
+* `prolong/make/{type}` — check the end dates in `proxyList(type)` or the renewal in
+  `orderList(is_extend='Y')`;
+* `balance/add` — check `balance()` and the payment history in your account.
+
+In each of these cases the library raises `ApiError`:
+
+| what happened | `error.http_status` | `error.errors` |
+|---|---|---|
+| timeout or dropped connection | `None`; `error.__cause__` is the `requests` exception (`requests.Timeout`, `requests.ConnectionError`, …) without the key | `[]` |
+| 5xx from the API or from the edge | the status | from the body, if it had any |
+| a 2xx answer without the `{status, data, errors}` envelope on a money or write request — `Unexpected response to order/make (HTTP 200, no JSON envelope); the request may have been executed - check before retrying` | the status | `[]` |
+
+```python
+try:
+    order = api.orderMakeIpv4('USA', '1m', 1, customTargetName='seo')
+except ApiError as error:
+    outcome_unknown = (error.http_status is None or error.http_status >= 500
+                       or not error.errors)
+    if not outcome_unknown:
+        raise                    # the API answered: read error.errors
+    # Timeout, dropped connection, 5xx or an answer without the envelope: the order may exist
+    # and be paid. Look for it before placing it again.
+    recent = api.orderList(sort_by='date_insert', order='desc', limit=10)['items']
+```
 
 ## Identifiers
 
@@ -645,6 +728,19 @@ Changes made after the 2.0 release, in the order the server shipped them:
   `Retry-After`, so a call can now block the calling thread for a while. Nothing else is
   retried. `'rate_limit': {'enabled': False}` in the config restores the previous behaviour
   exactly.
+- **The payment passed to a call wins over `setPaymentId()` / `setPaymentCode()`.** The client's
+  pair used to be merged into the request, and because a code wins over an id on the server,
+  `prolongMake(..., paymentId='balance')` after `setPaymentCode('paddle_subscription')` charged
+  the saved card. A call with its own `paymentId` or `paymentCode` now leaves the client's pair
+  out — see [Paying for orders](#paying-for-orders).
+- **Behaviour change: money and write requests succeed only on `status: "success"`.** A
+  `status: "error"` answer with `data` and an empty `errors[]`, and a 2xx answer without the
+  envelope, now raise `ApiError` instead of being returned; `*/calc` and the other reads are
+  parsed as before. Money requests wait up to 120 seconds (`money_timeout`) instead of 30 — see
+  [Timeouts and retries on payments](#timeouts-and-retries-on-payments).
+- **The API key no longer appears in errors.** A network error used to carry the request URL,
+  key included, in its message and in the chained `requests` exception — see
+  [The API key in errors and logs](#the-api-key-in-errors-and-logs).
 
 ## Tests
 
