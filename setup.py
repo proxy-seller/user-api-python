@@ -12,7 +12,7 @@ setup(
     name='proxy_seller_user_api',
     # 2.x = Client API v2 (baseUrl .../personal/api/v2/, ObjectId-строки, конверт
     # {status, data, errors}). 2.1 добавляет balance/autotopup/get и /set.
-    version='2.1.0',
+    version='2.1.1',
     author='proxy-seller',
     author_email='support@proxy-seller.com',
     description='Client library for the proxy-seller.com Client API v2',

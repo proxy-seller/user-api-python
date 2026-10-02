@@ -49,9 +49,18 @@ api.setPaymentCode('paddle_subscription')
 api.prolongMake('ipv4', ['1.2.3.4'], '1m', paymentId='balance')  # the balance pays, not the card
 ```
 
-Within one level the server rule stays: when a call passes both, `paymentCode` wins over
-`paymentId`, and the same goes for the two setters. When one `Api` instance is shared between
-threads, pass the payment with each call instead of switching the default.
+Within one call the server rule stays: when a call passes both, `paymentCode` wins over
+`paymentId`. The two setters replace each other — the last one called wins, as in the Java, PHP
+and Go SDKs:
+
+```python
+api.setPaymentCode('paddle_subscription')
+api.setPaymentId('balance')  # the default is now the balance; the card code is cleared
+```
+
+Before 2.1.1 the code set by `setPaymentCode()` outlived a later `setPaymentId()`, so the switch
+above kept charging the saved card. When one `Api` instance is shared between threads, pass the
+payment with each call instead of switching the default.
 
 `balancePaymentsList()` is not the place to pick an order payment from: it lists the systems for
 topping the balance up with `balanceAdd()` and never includes the balance itself. That top-up is
@@ -669,6 +678,14 @@ api.residentSubUserListDelete('PACKAGE_KEY', 561)  # {'status': 'delete'} | {'st
   `*Code` options are optional; `rotationId` never takes a code.
 - `authActive(id, "Y")` became `authChange(id, True)`.
 - `ping()` and `proxyCheck()` have no v2 equivalent.
+- API errors raise `ApiError`, which subclasses `Exception`, not `ValueError`. 1.x raised a bare
+  `ValueError` with the first message, so `except ValueError:` no longer catches API errors —
+  catch `ApiError`; it carries `code`, `errors` and `http_status`. `ValueError` / `TypeError`
+  come from the SDK's own argument checks, before anything is sent.
+- There is no default payment system. 1.x sent `paymentId=1` on orders and `29` from
+  `balanceAdd()` — v1 numeric ids that v2 refuses (`Incorrect payment system`). Call
+  `setPaymentCode('balance')` (or `'paddle_subscription'`) or pass the payment per call;
+  `balanceAdd()` takes an id from `balancePaymentsList()`.
 - `residentListDelete()` sends the ID in the request body.
 - `balanceAdd()` uses its explicit `paymentId`, then falls back to `setPaymentId()`;
   `paymentCode` is not accepted here.
@@ -741,6 +758,14 @@ Changes made after the 2.0 release, in the order the server shipped them:
 - **The API key no longer appears in errors.** A network error used to carry the request URL,
   key included, in its message and in the chained `requests` exception — see
   [The API key in errors and logs](#the-api-key-in-errors-and-logs).
+- **2.1.1: the two payment setters replace each other.** `setPaymentId()` after
+  `setPaymentCode()`, or the other way round, switches the client's default: the last call wins,
+  as in the Java, PHP and Go SDKs. Before, the code outlived a later `setPaymentId()`, so
+  `setPaymentCode('paddle_subscription')` followed by `setPaymentId('balance')` still charged the
+  saved card.
+- **2.1.1: `{type}` is URL-encoded in the path** of `reference/list`, `proxy/list`,
+  `proxy/download`, `prolong/*` and `autoprolong/*`, as in the other SDKs. A `/` in the value
+  used to split the path, and the request queue then took a `prolong/make` call for a read.
 
 ## Tests
 

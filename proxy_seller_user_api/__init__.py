@@ -614,6 +614,10 @@ class Api:
         paymentCode, пара setPaymentId()/setPaymentCode() в этот запрос не подмешивается вовсе
         (см. _payment_for).
 
+        setPaymentId() и setPaymentCode() вытесняют друг друга: выигрывает последний вызов, как
+        в Java, PHP и Go. Раньше код клиента был старше id, и setPaymentId('balance') после
+        setPaymentCode('paddle_subscription') оставлял оплату привязанной картой.
+
         Заказы и продления оплачиваются только балансом или привязанной картой: здесь
         подходят 'balance' и 'paddle_subscription' — код (сервер, не найдя ObjectId,
         резолвит значение как код) либо ObjectId одной из этих двух систем; остальные
@@ -623,6 +627,8 @@ class Api:
         (самого баланса в этом списке нет), см. balanceAdd.
         """
         self.paymentId = id
+        if id is not None:
+            self.paymentCode = None
 
     def getPaymentId(self):
         return self.paymentId
@@ -634,8 +640,12 @@ class Api:
 
         Значение ПО УМОЛЧАНИЮ для клиента, как и setPaymentId(): платёжка, переданная в вызов
         (paymentId или paymentCode), главнее, и тогда пара клиента не уходит вовсе.
+
+        Сбрасывает setPaymentId(): выигрывает последний из двух вызовов (см. setPaymentId).
         """
         self.paymentCode = code
+        if code is not None:
+            self.paymentId = None
 
     def getPaymentCode(self):
         return self.paymentCode
@@ -1150,7 +1160,7 @@ class Api:
         """
         if type is None:
             return self.request('GET', 'reference/list')
-        return self.request('GET', 'reference/list/' + str(type))
+        return self.request('GET', 'reference/list/' + self._segment(type))
 
     def prepare(self, **kwargs):
         return self.filterNone(dict(kwargs))
@@ -1168,6 +1178,16 @@ class Api:
     def _filled(value):
         """Задано ли значение для сервера: None и строка из одних пробелов — "не задано"."""
         return value is not None and str(value).strip() != ''
+
+    @staticmethod
+    def _segment(value):
+        """
+        Значение {type} для пути — URL-кодированным одним сегментом, как в Java, PHP и Go.
+
+        Без кодирования '/' в значении дробил путь на лишние сегменты, и очередь относила
+        такой вызов не к своей категории (prolong/make/{type} — к чтению с его мягким разбором).
+        """
+        return quote(str(value), safe='')
 
     def _payment_for(self, values, fields=('paymentId', 'paymentCode')):
         """
@@ -1897,7 +1917,7 @@ class Api:
                 mix_isp — все активные прокси выбранных заказов.
         """
         values = self._order_options(options, prolong_options)
-        return self.request('POST', 'prolong/calc/' + type,
+        return self.request('POST', 'prolong/calc/' + self._segment(type),
                             json=self.prepareProlong(ids, periodId, coupon, values, type))
 
     def prolongMake(self, type, ids=None, periodId=None, coupon='', options=None, **prolong_options):
@@ -1934,7 +1954,7 @@ class Api:
         # в errors[{code:16}], разбирается общим кодом конверта. Единственным оставшимся её
         # эффектом было превращать ЛЕГИТИМНЫЙ "status: success" с пустым orderId в фальшивую
         # ошибку — уже ПОСЛЕ списания денег, потеряв total/balance/listBaseOrderNumbers.
-        return self.request('POST', 'prolong/make/' + type,
+        return self.request('POST', 'prolong/make/' + self._segment(type),
                             json=self.prepareProlong(ids, periodId, coupon, values, type))
 
     # --------------------------- Auto prolong ---------------------------
@@ -2078,7 +2098,7 @@ class Api:
         values = self._order_options(options, autoprolong_options)
         payload = self.prepareAutoProlong(ids, periodId, values, type)
         self._assert_auto_prolong_payment(payload)
-        return self.request('POST', 'autoprolong/calc/' + type, json=payload)
+        return self.request('POST', 'autoprolong/calc/' + self._segment(type), json=payload)
 
     def autoProlongEnable(self, type, ids=None, periodId=None, options=None, **autoprolong_options):
         """
@@ -2109,7 +2129,7 @@ class Api:
         values = self._order_options(options, autoprolong_options)
         payload = self.prepareAutoProlong(ids, periodId, values, type)
         self._assert_auto_prolong_payment(payload)
-        return self.request('POST', 'autoprolong/enable/' + type, json=payload)
+        return self.request('POST', 'autoprolong/enable/' + self._segment(type), json=payload)
 
     def autoProlongDisable(self, type, ids=None, options=None, **autoprolong_options):
         """
@@ -2139,7 +2159,7 @@ class Api:
         """
         self._assert_auto_prolong_type(type)
         values = self._order_options(options, autoprolong_options)
-        return self.request('POST', 'autoprolong/disable/' + type,
+        return self.request('POST', 'autoprolong/disable/' + self._segment(type),
                             json=self.prepareAutoProlong(ids, None, values, type))
 
     # --------------------------- Proxy ---------------------------
@@ -2169,7 +2189,7 @@ class Api:
         params = self.filterNone(filters)
         if type is None:
             return self.request('GET', 'proxy/list', params=params)
-        return self.request('GET', 'proxy/list/' + str(type), params=params)
+        return self.request('GET', 'proxy/list/' + self._segment(type), params=params)
 
     def proxyDownload(self, type, ext=None, proto=None, listId=None, **filters):
         """
@@ -2204,7 +2224,8 @@ class Api:
                 "for the main resident package use proxyDownloadResident().")
         params = {'ext': self.assertExt(ext), 'proto': proto, 'listId': listId}
         params.update(filters)
-        return self.request('GET', 'proxy/download/' + type, params=self.filterNone(params))
+        return self.request('GET', 'proxy/download/' + self._segment(type),
+                            params=self.filterNone(params))
 
     def proxyDownloadResident(self, id=None, ext=None, maxLine=None):
         """
