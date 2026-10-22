@@ -139,6 +139,26 @@ class ProxyDownloadTest(unittest.TestCase):
         api.proxyDownload('resident', ext='txt')
         self.assertEqual(session.last['params'], {'ext': 'txt'})
 
+    def test_resident_protocol_and_host_are_sent(self):
+        api, session = make_api([text_file('socks5://a:b@us.res.proxy-seller.com:10000')])
+        api.proxyDownloadResident('561', 'txt', 10, protocol='socks5', host='us.res.proxy-seller.com')
+        call = session.last
+        self.assertTrue(call['url'].endswith('proxy/download/resident'))
+        self.assertEqual(call['params'], {'id': '561', 'ext': 'txt', 'maxLine': 10,
+                                          'protocol': 'socks5', 'host': 'us.res.proxy-seller.com'})
+
+    def test_resident_without_protocol_and_host_is_unchanged(self):
+        api, session = make_api([text_file('a:b@res.proxy-seller.com:10000')])
+        api.proxyDownloadResident('561', 'txt', 10)
+        self.assertEqual(session.last['params'], {'id': '561', 'ext': 'txt', 'maxLine': 10})
+
+    def test_subresident_protocol_and_host_are_sent(self):
+        api, session = make_api([text_file('http://a:b@asia.res.proxy-seller.com:10000')])
+        api.proxyDownload('subresident', ext='txt', package_key='PKG',
+                          protocol='http', host='asia.res.proxy-seller.com')
+        self.assertEqual(session.last['params'], {'ext': 'txt', 'package_key': 'PKG',
+                                                  'protocol': 'http', 'host': 'asia.res.proxy-seller.com'})
+
     def test_ext_validation(self):
         with self.assertRaises(ValueError):
             Api.assertExt('a' * 251)

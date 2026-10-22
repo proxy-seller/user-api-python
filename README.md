@@ -624,6 +624,19 @@ Downloads return a file, not the envelope: `text/plain` for `txt` and custom tem
 `proxyDownload('subresident', package_key='KEY')` for a subpackage and
 `proxyDownloadResident(id=...)` for the main package.
 
+Residential lines take the connection scheme in `protocol` (`http` or `socks5`) and the gateway
+in `host`. With `txt` a line becomes `socks5://login:password@host:port`, `csv` keeps its
+columns, and a custom template gets the value in `%protocol%`; without `protocol` the lines have
+no scheme, as before. Login, password and ports are the same for both protocols. `socks5` also
+carries UDP and HTTP/3 (QUIC) to websites. Gateways: `res.proxy-seller.com` (Europe, the
+default), `us.res.proxy-seller.com`, `asia.res.proxy-seller.com` — pick the one closest to your
+server. This is not `proto`, which selects IPv4 ports:
+
+```python
+api.proxyDownloadResident(id='LIST_ID', protocol='socks5', host='us.res.proxy-seller.com')
+api.proxyDownload('subresident', ext='txt', package_key='KEY', protocol='http')
+```
+
 ## Resident and subuser lists
 
 `resident/lists` returns a **flat array** (no `items` wrapper).
@@ -766,6 +779,10 @@ Changes made after the 2.0 release, in the order the server shipped them:
 - **2.1.1: `{type}` is URL-encoded in the path** of `reference/list`, `proxy/list`,
   `proxy/download`, `prolong/*` and `autoprolong/*`, as in the other SDKs. A `/` in the value
   used to split the path, and the request queue then took a `prolong/make` call for a read.
+- **Unreleased: `protocol` and `host` in residential exports.** `proxyDownloadResident()` takes
+  `protocol=` and `host=`, and `proxyDownload('subresident', ...)` passes them on as filters: the
+  connection scheme (`http` / `socks5`) and the gateway in the lines. Without them the request and
+  the lines are the same as before — see [Proxies](#proxies).
 
 ## Tests
 

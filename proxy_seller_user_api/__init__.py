@@ -2206,7 +2206,10 @@ class Api:
                 csv — '%ip%;%port%;%login%;%password%'). Ограничения см. assertExt().
             proto (str): https | socks5 | None (иные значения сервер игнорирует)
             listId (str): only for resident-family types
-            filters: package_key (ТОЛЬКО subresident), country (код страны), ends
+            filters: package_key (ТОЛЬКО subresident), country (код страны), ends,
+                protocol и host — схема (http | socks5) и шлюз в строках резидентов, только
+                resident и subresident (см. proxyDownloadResident()). protocol — это не proto:
+                proto выбирает порты IPv4
 
         Note:
             Для резидентских листов основного пакета используйте proxyDownloadResident().
@@ -2227,7 +2230,7 @@ class Api:
         return self.request('GET', 'proxy/download/' + self._segment(type),
                             params=self.filterNone(params))
 
-    def proxyDownloadResident(self, id=None, ext=None, maxLine=None):
+    def proxyDownloadResident(self, id=None, ext=None, maxLine=None, protocol=None, host=None):
         """
         Export the resident proxy list (файл, attachment).
 
@@ -2240,12 +2243,20 @@ class Api:
                 это не ObjectId.
             ext (str): txt | csv | кастомный шаблон (см. proxyDownload)
             maxLine (int): Maximum number of lines.
+            protocol (str): http | socks5. При txt строка становится
+                ``socks5://login:password@host:port``, csv не меняется, кастомный шаблон
+                получает значение в %protocol%; None — строки без схемы, как раньше. Логин,
+                пароль и порты у обоих протоколов одни; socks5 несёт ещё UDP и HTTP/3 (QUIC)
+                к сайтам. Не путать с proto у proxyDownload(): тот выбирает порты IPv4.
+            host (str): шлюз — res.proxy-seller.com (по умолчанию), us.res.proxy-seller.com,
+                asia.res.proxy-seller.com.
 
         Returns:
             str: The exported proxies.
         """
         return self.request('GET', 'proxy/download/resident', params=self.filterNone(
-            {'id': id, 'ext': self.assertExt(ext), 'maxLine': maxLine}))
+            {'id': id, 'ext': self.assertExt(ext), 'maxLine': maxLine,
+             'protocol': protocol, 'host': host}))
 
     #: Допустимые значения type у proxy/replace — ПРИЧИНА замены.
     PROXY_REPLACE_TYPES = (
